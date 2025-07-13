@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+src/bifo/__init__.py
+src/bifo/fetchChunckFromMips.py
+src/bifo/fetchChunckFromMips_backup.py
+src/bifo/trainTools.py
+src/bifo.egg-info/PKG-INFO
+src/bifo.egg-info/SOURCES.txt
+src/bifo.egg-info/dependency_links.txt
+src/bifo.egg-info/top_level.txt

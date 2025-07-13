@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 \# bifo
 
 
@@ -58,3 +59,7 @@ If you use this package in your research, please cite it as described in `CITATI
 
 
 
+=======
+# bifo
+Package of biological image processing modules named after bifoveate retinas
+>>>>>>> 228390711efd709420f98e4afca4d897966377e3

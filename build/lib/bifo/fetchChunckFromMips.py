@@ -11,6 +11,9 @@ import re
 from PIL import Image, ExifTags
 import matplotlib.pyplot as plt
 
+plt.ion()
+fig = plt.figure
+    
     
 class fetchDiced:
     """
@@ -407,10 +410,10 @@ class fetchDiced:
             show_planes = [plane]
                
         plt.ion()
-        fig_num = plt.get_fignums()
+        fig_num = plt.get_fignums()[-1]
         
         if fig_num:
-            fig = plt.figure(fig_num[-1])
+            fig = plt.figure(fig_num)
         else:
             fig = plt.figure()
             
@@ -435,14 +438,7 @@ class fetchDiced:
 
 
 
-if __name__ == "__main__": #test
-
-
-
-    plt.ion()
-    fig = plt.figure
-    
-    
+if 1: # test
     fd_request = {
         "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
         "mip_level": 1,

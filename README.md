@@ -35,9 +35,8 @@ pip install .
 
 ```python
 
-from bifo import trainTools
-
-from bifo import fetchChunkFromMips
+import bifo.trainTools as tt
+from bifo.fetchChunckFromMips import fetchDiced
 
 ```
 

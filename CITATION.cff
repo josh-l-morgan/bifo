@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "bifo: biological image processing tools"
+authors:
+  - family-names: Morgan
+    given-names: Josh L.
+    email: chilopod@gmail.com
+    affiliation: "Washington University in St. Louis"
+version: "0.1.0"
+license: MIT
+doi: ""  
+date-released: 2025-07-13
+repository-code: https://github.com/josh-l-morgan/bifo

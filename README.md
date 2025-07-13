@@ -1,2 +1,2 @@
 # bifo
-Biological image processing tools named after bifoveate retinas
+Package of biological image processing modules named after bifoveate retinas

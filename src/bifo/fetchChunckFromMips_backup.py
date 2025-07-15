@@ -12,39 +12,56 @@ from PIL import Image, ExifTags
 import matplotlib.pyplot as plt
 
     
-    
-class mapDiced:
+class fetchDiced:
     """
     Collect information required for fetching images from a dataset that 
     Has been diced to be red by VAST
     """    
 
-    def __init__(self,diced_dir, analyze_mip = 'None', analyze_sections = 'None'):
+    def __init__(self, mr):
         """
-        Args:
-            diced_dir(str): Path to diced dataset directory
-            analyze_mip (list): Mip level to examine tiles in
-            analyze_sections (list): Sections to examine tiles in
-        
-        Data:
+               
+        Standard Example: 
+            map_request = {
+                "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
+                "mip_level": 1,
+                "analyze_section": [400], 
+                "volume_lower_corner_zyx": [600,25000, 35000],
+                "volume_size_zyx": [32, 1024, 1024],
+                "chunk_shape_zyx": [16, 256, 256],
+                "chunk_overlap": [8, 128, 128],
+                }
+            
+            fd = fetchDiced(map_request)
+            for i in range(fd.num_chunk)
+                fd.readChunk(i)
+                fd.viewChunk() #optional display
+                coolAnalysis(fd.chunk)
+                
+        Additional Data:
             sec_dirs: list of section names
             sec_nums: np.array of section numbers
             mappedMips: dictionary containing information about mips. produced by mapMipDir
             
-        Functions:
-            mapMipDirs: identify mip folders for all sections. produce mappedMips
-                
+        Additional Functions:
+              mapMipDirs: identify mip folders for all sections. produce mappedMips   
+        
         """
         
-        self.diced_dir = diced_dir
+        self.map_request = mr
+        self.diced_dir = mr["diced_dir"]
         
-        self.analyze_sections = analyze_sections
-        self.analyze_mip = analyze_mip
+        self.analyze_sections = mr["analyze_section"]
+        self.analyze_mip = [mr["mip_level"]]
 
         self.findSections()  
         #self.mapMipDirs()
         self.getTileMetadata()
-        
+        self.findValidCorners()        
+        self.fetchList()
+        self.chunkList()
+        self.prepareToReadChunks()
+                
     def findSections(self):
         # read section list as firs subdirector
                  
@@ -117,46 +134,88 @@ class mapDiced:
                 except:
                     print(f"could not open {image_path}")
                 else:
-                    print(f"read {image_path}")
                     self.img_info.append({"size": img.size})
                     if not tilEnd:
                         break
                         
-            self.tileSize = self.img_info[0]['size'][0]
+            self.tile_size = self.img_info[0]['size'][0]
                     
-    def fetchList(self, raw_corner, depth, height, width, use_mip = 'None'):
+    def findValidCorners(self):
         
-        # store request arguments
-        request = {
-            "raw_corder": raw_corner,
-            "depth": depth,
-            "width": width,
-            "height": height,
-            "use_mip": use_mip
-        }
-             
+
+        mr = self.map_request
+        furthest_vox = (mr["volume_lower_corner_zyx"] + mr["volume_size_zyx"] + mr['chunk_shape_zyx']) * 2
+        chunk_shape = np.array(mr['chunk_shape_zyx'])
+        raw_overlap = np.array(mr['chunk_overlap'])
         
-        if use_mip == 'None':
-            use_mip = 0
+        clp = np.round(raw_overlap/2)
+        overlap = clp * 2
+        clipped_shape = [int(d-clp[i]-clp[i]) for i,d in enumerate(chunk_shape)]
+
+        # calculate chunks and clip info. find corners that align with zarr prediction
+        max_clips = np.ceil(furthest_vox/clipped_shape)+1
         
-        tileSize = self.tileSize
+        valid_clipped_corners_1  = []
+        valid_chunk_corners_1 = []
+        valid_clipped_corners_2 = []
+        valid_chunk_corners_2 = []
+        for d in range(3):            
+            valid_clipped_corners_1.append(np.arange(max_clips[d]) * clipped_shape[d])
+            valid_chunk_corners_1.append(valid_clipped_corners_1[d]  - clp[d] )
+            valid_clipped_corners_2.append(valid_clipped_corners_1[d] + clipped_shape[d]-1)
+            valid_chunk_corners_2.append(valid_chunk_corners_1[d] + chunk_shape[d]-1)
+            
+        self.valid = {
+            'overlap': overlap,
+            'clip': clp,
+            'clip_shape': clipped_shape,
+            'chunk_shape': chunk_shape,
+            'valid_clipped_corners_1':  valid_clipped_corners_1,
+            'valid_chunk_corners_1':  valid_chunk_corners_1,
+            'valid_clipped_corners_2':  valid_clipped_corners_2,
+            'valid_chunk_corners_2':  valid_chunk_corners_2
+            }
+    
+    
+    def fetchList(self):
+            
+        mr = self.map_request
+        v = self.valid
+        raw_corner = mr["volume_lower_corner_zyx"]
+        volume_zyx = mr['volume_size_zyx'] 
+        use_mip = mr['mip_level']
+        overlap = mr['chunk_overlap']
+        
+                
+        tile_size = self.tile_size
         
         # get voxel corners
-        corner1 = np.array(raw_corner)
-        corner1[1:2] = np.round(corner1[1:2]/2)
-        corner2 = corner1 + np.array((depth,height,width))
+        fov_corner_1 = np.array(raw_corner)
+        fov_corner_1[1:] = np.round(fov_corner_1[1:]/(2 ** use_mip))
+        fov_corner_2 = fov_corner_1 + np.array(volume_zyx) -1
+        
+        corner_1 = np.zeros(3,int)
+        corner_2 = np.zeros(3,int)
+        for d in range(3):
+            corner_1[d] = v['valid_chunk_corners_1'][d][ 
+                np.where(v['valid_clipped_corners_1'][d] <= fov_corner_1[d])[0][-1]]
+            corner_2[d] = v['valid_chunk_corners_1'][d][ 
+                np.where(v['valid_clipped_corners_2'][d] >= fov_corner_2[d])[0][0]]
+        
         
         # get tile corners
-        cornerTile1 = corner1.copy();
-        cornerTile1[1:] = np.floor(cornerTile1[1:] / tileSize)
-        cornerTile2 = corner2.copy();
-        cornerTile2[1:] = np.floor(cornerTile2[1:] / tileSize) 
+        corner_tile_1 = corner_1.copy();
+        corner_tile_1[1:] = np.floor(corner_tile_1[1:] / tile_size)
+        corner_tile_2 = corner_2.copy();
+        corner_tile_2[1:] = np.floor(corner_tile_2[1:] / tile_size)
+        corner_full_vox_1 = corner_tile_1 * [1, tile_size, tile_size]
+        corner_full_vox_2 = corner_tile_2 * [1, tile_size, tile_size] + [0, tile_size, tile_size] - [0, 1, 1]
         
         # make tile list
         tile_zrc_list = []
-        for r in range(cornerTile1[1], cornerTile2[1]+1):
-            for c in range(cornerTile1[2], cornerTile2[2]+1):
-                for z in range(cornerTile1[0], cornerTile2[0]+1):
+        for r in range(corner_tile_1[1], corner_tile_2[1]+1):
+            for c in range(corner_tile_1[2], corner_tile_2[2]+1):
+                for z in range(corner_tile_1[0], corner_tile_2[0]+1):
                     tile_zrc_list.append([z,r,c])
                     
         # make tile names
@@ -165,84 +224,141 @@ class mapDiced:
              tile_paths.append(f"{self.diced_dir}{zrc[0]}/{use_mip}/{zrc[1]}_{zrc[2]}.png")
                  
         fetch_list = {
-            "request": request,
             "tile_zrc_array": np.array(tile_zrc_list),
             "tile_paths": tile_paths,   
-            "corner1": corner1,
-            "corner2": corner2
+            "corner_1": corner_1,
+            "corner_2": corner_2,
+            "corner_tile_1": corner_tile_1,
+            "corner_tile_2": corner_tile_2,
+            "corner_full_vox_1": corner_full_vox_1,
+            "corner_full_vox_2": corner_full_vox_2
         }
         
         self.fetch_list = fetch_list
     
-    def chunkList(self,raw_chunck_size,raw_overlap):
+    def chunkList(self):
         
         #note, most for loops should be replaced by array operations
         
         fl = self.fetch_list
-        tileSize = self.tileSize
-        chunk_size = np.array(raw_chunck_size)
-        overlap = np.array(raw_overlap)
+        v = self.valid
+        tile_size = self.tile_size
+        chunk_shape = v['chunk_shape']
+        overlap = v['overlap']
         list_ok = 'true'
         
-        step = chunk_size - overlap
+        # calculate chunks and clip info. find corners that align with zarr prediction
+        furthest_vox = fl["corner_full_vox_2"]
+        step = chunk_shape - overlap
+        clp = [int(d/2) for d in overlap]
+        clipped_shape = [int(d-clp[i]-clp[i]) for i,d in enumerate(chunk_shape)]
+        max_clips = np.ceil(furthest_vox/clipped_shape)+1
+        first_chunk_corner = np.zeros(3,dtype=int)
+        last_chunk_corner = np.zeros(3,dtype=int)
+        for d in range(3):
+            
+            
+            valid_clipped_corners_1 = np.arange(max_clips[d]) * clipped_shape[d]
+            valid_chunk_corners_1 = valid_clipped_corners_1  - clp[d]            
+            first_chunk_corner_in_tile = valid_chunk_corners_1[ 
+                np.where(valid_chunk_corners_1 >= fl['corner_full_vox_1'][d])[0][0]]
+            last_chunk_corner_before_target = valid_chunk_corners_1[ 
+                np.where(valid_clipped_corners_1 <= fl['corner_1'][d])[0][-1]]
+            first_chunk_corner[d] = np.max((last_chunk_corner_before_target, first_chunk_corner_in_tile))
+            
+            valid_clipped_corners_2 = first_chunk_corner[d] + np.arange(max_clips[d]) * step[d] - 1 - clp[d]
+            valid_chunk_corners_2 = valid_clipped_corners_2  + clp[d]
+            last_chunk_corner_in_tile = valid_chunk_corners_2[ 
+                np.where(valid_chunk_corners_2 <= fl['corner_full_vox_2'][d])[0][-1]]
+            first_chunk_corner_after_target = valid_chunk_corners_2[ 
+                np.where(valid_clipped_corners_2 >= fl['corner_2'][d])[0][0]]
+            last_chunk_corner[d] = np.max((last_chunk_corner_in_tile, first_chunk_corner_after_target))
+            
+            
         
         # make tile list
-        chunk_zrc_corner1 = []
-        for r in range(fl['corner1'][1], fl['corner2'][1]-step[1]+1,step[1]):
-            for c in range(fl['corner1'][2], fl['corner2'][2]-step[2]+1,step[2]):
-                for z in range(fl['corner1'][0], fl['corner2'][0]-step[0]+1,step[0]):
-                    chunk_zrc_corner1.append([z,r,c])
+        chunk_zrc_corner_1 = []
+        for r in range(first_chunk_corner[1], last_chunk_corner[1],step[1]):
+            for c in range(first_chunk_corner[2], last_chunk_corner[2],step[2]):
+                for z in range(first_chunk_corner[0], last_chunk_corner[0],step[0]):
+                    chunk_zrc_corner_1.append([z,r,c])
         
-        num_chunk = len(chunk_zrc_corner1)
-        corners1 = np.array(chunk_zrc_corner1)
-        corners2 = corners1 + chunk_size - 1
+        num_chunk = len(chunk_zrc_corner_1)
+        corners_1 = np.array(chunk_zrc_corner_1,int)
+        corners_2 = corners_1 + chunk_shape - 1
         
-        cornersTile1 = np.copy(corners1)
-        cornersVox1 = np.copy(corners1)
-        cornersTile1[:,1:] = np.floor(corners1[:,1:] / tileSize)
-        cornersVox1[:,1:] = np.remainder(corners1[:,1:], tileSize)
+        clipped_corners_1 = corners_1 + clp
+        clipped_corners_2 = corners_2 - clp
         
-        first_tile_vox_num = np.minimum(chunk_size[1],tileSize-cornersVox1 + 1)
+        
+        corners_tile_1 = np.copy(corners_1)
+        corners_vox_1 = np.copy(corners_1)
+        corners_tile_1[:,1:] = np.floor(corners_1[:,1:] / tile_size)
+        corners_vox_1[:,1:] = np.remainder(corners_1[:,1:], tile_size) #0 to tile_size-1
+             
+        
+        first_tile_vox_num = np.minimum(chunk_shape[1]-1,tile_size-corners_vox_1-1)
         
                
-        cornersTile2 = np.copy(corners2)
-        cornersVox2 = np.copy(corners2)
-        cornersTile2[:,1:] = np.floor(corners2[:,1:] / tileSize)
-        cornersVox2[:,1:] = np.remainder(corners2[:,1:], tileSize)
+        corners_tile_2 = np.copy(corners_2)
+        corners_vox_2 = np.copy(corners_2)
+        corners_tile_2[:,1:] = np.floor(corners_2[:,1:] / tile_size)
+        corners_vox_2[:,1:] = np.remainder(corners_2[:,1:], tile_size)
+        
+        
         
         # create four tile -> chunck index mappings for each chunk, chunk quarters
-        chunk_vox = np.zeros([num_chunk,2,2,2])
-        tile_vox = np.zeros([num_chunk,2,2,2])
-        tile_rc = np.zeros([num_chunk,2,2])
-        tile_zs = np.zeros([num_chunk,chunk_size[0]])
-        for i in range(num_chunk):
-            tile_zs[i,:] = np.arange(corners1[i,0],corners2[i,0]+1)
-            # order is chuck, r(0) or c(0), first or second, run
-            chunk_vox[i,0,0,:] = np.array([1,first_tile_vox_num[i,1]])
-            chunk_vox[i,0,1,:] = np.array([first_tile_vox_num[i,1]+1,chunk_size[1]])
-            chunk_vox[i,1,0,:] = np.array([1,first_tile_vox_num[i,2]])
-            chunk_vox[i,1,1,:] = np.array([first_tile_vox_num[i,2]+1,chunk_size[2]])
-            
-            tile_vox[i,0,0,:] = np.array([cornersVox1[i,1], cornersVox1[i,1] + first_tile_vox_num[i,1]-1])
-            tile_vox[i,0,1,:] = np.array([1, cornersVox2[i,1]])
-            tile_vox[i,1,0,:] = np.array([cornersVox1[i,2], cornersVox1[i,2] + first_tile_vox_num[i,2]-1])
-            tile_vox[i,1,1,:] = np.array([1, cornersVox2[i,2]])    
-            
-            # First corner values
-            tile_rc[i,0,0] = cornersTile1[i,1]
-            tile_rc[i,1,0] = cornersTile1[i,2]
- 
-            # Second value for r 
-            if cornersTile2[i,1] == cornersTile1[i,1]:
-                tile_rc[i,0,1] = -1 
-            else:
-                tile_rc[i,0,1] = cornersTile2[i,1]
-            
-            # Second value for c    
-            if cornersTile2[i,2] == cornersTile1[i,2]:
-                tile_rc[i,1,1] = -1 
-            else:
-                tile_rc[i,1,1] = cornersTile2[i,2]    
+        chunk_vox = np.zeros([num_chunk,2,2,2,2],int)
+        tile_vox = np.zeros([num_chunk,2,2,2,2],int)
+        tile_rc = np.zeros([num_chunk,2,2,2],int)
+        tile_zs = np.zeros([num_chunk,chunk_shape[0]],int)
+        
+        # Arange tile r c information into quandrants
+        tile_rc[:,0,:,0] = corners_tile_1[:,1][:, None] * np.ones((1, 2))
+        tile_rc[:,:,0,1] = corners_tile_1[:,2][:, None] * np.ones((1, 2))
+        tile_rc[:,1,:,0] = corners_tile_2[:,1][:, None] * np.ones((1, 2))
+        tile_rc[:,:,1,1] = corners_tile_2[:,2][:, None] * np.ones((1, 2))
+    
+        # negate quandrants where chunck doesnt cross tiles
+        same_r = tile_rc[:,0,0,0] == tile_rc[:,1,0,0]
+        same_c = tile_rc[:,0,0,1] == tile_rc[:,0,1,1]
+        tile_rc[same_r,1,:,:] = -1 
+        tile_rc[same_c,:,1,:] = -1
+    
+        # get z positions for each chunk
+        tile_zs = corners_1[:,0][:,None] + np.arange(0,chunk_shape[0])[None,:]  
+    
+        # quarter r_q = 0, c_q = 0 
+        chunk_vox[:,0,0,0,:] = first_tile_vox_num[:,1][:,None] * [0,1] 
+        chunk_vox[:,0,0,1,:] = first_tile_vox_num[:,2][:,None] * [0,1] 
+        # quarter r_q = 0, c_q = 1 
+        chunk_vox[:,0,1,0,:] = first_tile_vox_num[:,1][:,None] * [0,1] 
+        chunk_vox[:,0,1,1,:] = first_tile_vox_num[:,2][:,None] * [1,0] + [1,0] + [0,chunk_shape[1]-1]
+        # quarter r_q = 1, c_q = 0 
+        chunk_vox[:,1,0,0,:] = first_tile_vox_num[:,1][:,None] * [1,0] + [1,0] + [0,chunk_shape[1]-1]
+        chunk_vox[:,1,0,1,:] = first_tile_vox_num[:,2][:,None] * [0,1] 
+        # quarter r_q = 1, c_q = 0 
+        chunk_vox[:,1,1,0,:] = first_tile_vox_num[:,1][:,None] * [1,0] + [1,0] + [0,chunk_shape[1]-1]
+        chunk_vox[:,1,1,1,:] = first_tile_vox_num[:,2][:,None] * [1,0] + [1,0] + [0,chunk_shape[1]-1]
+
+        first_reach = corners_vox_1 + first_tile_vox_num
+        # quarter r_q =0 , c_q = 0  
+        tile_vox[:,0,0,0,:] = np.stack([corners_vox_1[:,1], first_reach[:,1]], axis = 1)
+        tile_vox[:,0,0,1,:] = np.stack((corners_vox_1[:,2], first_reach[:,2]), axis = 1)
+        # quarter r_q =1 , c_q = 0  
+        tile_vox[:,1,0,0,:] = corners_vox_2[:,1][:,None] * [0,1]         
+        tile_vox[:,1,0,1,:] = np.stack((corners_vox_1[:,2], first_reach[:,2]), axis = 1) 
+        # quarter r_q =0 , c_q = 0  
+        tile_vox[:,0,1,0,:] = np.stack([corners_vox_1[:,1], first_reach[:,1]], axis = 1)
+        tile_vox[:,0,1,1,:] = corners_vox_2[:,2][:,None] * [0,1] 
+        # quarter r_q =0 , c_q = 0  
+        tile_vox[:,1,1,0,:] = corners_vox_2[:,1][:,None] * [0,1]
+        tile_vox[:,1,1,1,:] = corners_vox_2[:,2][:,None] * [0,1]
+        
+        # chunk_vox[:,:,:,:,1] = chunk_vox[:,:,:,:,1] +1 #stupid python indexing...
+        # tile_vox[:,:,:,:,1] = tile_vox[:,:,:,:,1] +1 #stupid python indexing...
+
+                               
                         
         # Test mapping logic, all references should add up to chunk size
         count_chunk_vox_rc = np.zeros([num_chunk,2])
@@ -250,14 +366,15 @@ class mapDiced:
         count_same_t = np.zeros([num_chunk,2])
         for i in range(num_chunk):
             for d in range(2):
-                if tile_rc[i,d,0] == tile_rc[i,d,1]:
-                    count_same_t[i,d] = 1
-                for s in range(2):
-                    if tile_rc[i,d,s]>0:
-                        count_tile_vox_rc[i,d] = count_tile_vox_rc[i,d]  + tile_vox[i,d,s,1] - tile_vox[i,d,s,0] + 1
-                        count_chunk_vox_rc[i,d] = count_chunk_vox_rc[i,d]  + chunk_vox[i,d,s,1] - chunk_vox[i,d,s,0] + 1
-        bad_tile_count = np.sum(count_tile_vox_rc != chunk_size[1])   
-        bad_chunk_count = np.sum(count_chunk_vox_rc != chunk_size[1])   
+                for r_q in range(2):
+                    for c_q in range(2):
+            
+                        if tile_rc[i,r_q,c_q,d]>0:
+                            count_tile_vox_rc[i,d] = count_tile_vox_rc[i,d]  + tile_vox[i,r_q,c_q,d,1] - tile_vox[i,r_q,c_q,d,0] + 1
+                            count_chunk_vox_rc[i,d] = count_chunk_vox_rc[i,d]  + chunk_vox[i,r_q,c_q,d,1] - chunk_vox[i,r_q,c_q,d,0] + 1
+            
+        bad_tile_count = np.sum(count_tile_vox_rc != (chunk_shape[1]))   
+        bad_chunk_count = np.sum(count_chunk_vox_rc != (chunk_shape[1]))   
         
         if any(((bad_tile_count>0),(bad_chunk_count>0))):
             print('bad reference vox numbers')
@@ -265,13 +382,13 @@ class mapDiced:
   
         # Find ids for tiles
         fl_zrc = fl['tile_zrc_array']
-        tile_id = np.zeros([num_chunk,2,2,chunk_size[0]])-1 #tile id in quart space of chunck, row, colum, z
+        tile_id = np.zeros([num_chunk,2,2,chunk_shape[0]])-1 #tile id in quart space of chunck, row, colum, z
         for i in range(num_chunk):
             for r_q in range(2):
-                is_r = (fl_zrc[:,1] == tile_rc[i,0,r_q])
                 for c_q in range(2):
-                    is_c =  (fl_zrc[:,2]==tile_rc[i,1,c_q])
-                    for zs in range(chunk_size[0]):
+                    is_r = (fl_zrc[:,1] == tile_rc[i,r_q,c_q,0])
+                    is_c = (fl_zrc[:,2] == tile_rc[i,r_q,c_q,1])
+                    for zs in range(chunk_shape[0]):
                         is_z = fl_zrc[:,0] == tile_zs[i,zs]
                         targ_tile = np.where( is_z & is_r & is_c)[0]
                         if targ_tile.shape[0] == 0:
@@ -279,15 +396,21 @@ class mapDiced:
                         else:
                             tile_id[i,r_q,c_q,zs] = targ_tile[0]
                             
-                           
+        self.num_chunk = num_chunk                  
         self.chunk_list = {
-            "chunk_size": chunk_size,
+            "chunk_shape": chunk_shape,
             "num_chunk": num_chunk,
             "chunk_vox": chunk_vox,
             "tile_vox": tile_vox,
             "tile_rc": tile_rc,
             "tile_id": tile_id,
-            "list_ok": list_ok
+            "list_ok": list_ok,
+            "corners_full_vox_1": corners_1, 
+            "corners_full_vox_2": corners_2,
+            "clipped_corners_1": clipped_corners_1,
+            "clipped_corners_2": clipped_corners_2,
+            "clipped_shape": clipped_shape,
+            "clip": clp
         }
         
     def prepareToReadChunks(self):
@@ -295,12 +418,14 @@ class mapDiced:
         class tileCache:
             def __init__(self,md):
                 
-                csh_size = 2048
-                self.size = csh_size; # how many tiles to hold in memory
-                self.cache = ['' for i in range(csh_size)]
-                self.tile_ids = np.zeros(csh_size)-1
+                csh_num = 2048
+                
+                self.size = [csh_num, md.tile_size, md.tile_size] # how many tiles to hold in memory
+                self.dtype = 'float32'
+                self.cache = ['' for i in range(csh_num)]
+                self.tile_ids = np.zeros(csh_num,int)-1
                 self.tile_paths = md.fetch_list['tile_paths']
-                self.tile_age = np.zeros(csh_size)
+                self.tile_age = np.zeros(csh_num)
                 
             def requestTiles(self,need_tiles):
                 
@@ -314,6 +439,8 @@ class mapDiced:
                 
                 # if we need to load new tiles
                 still_need = np.where(cache_id<0)[0]
+                
+                
 
                 if  still_need.shape[0]>0:
                     keep = np.isin(self.tile_ids,need_tiles)
@@ -323,8 +450,12 @@ class mapDiced:
                         tile_id = int(need_tiles[still_need[sn]])
                         oldest = np.where(loose & 
                            (self.tile_age == self.tile_age[loose].max()))[0][0]                    
-                        tile_path = md.fetch_list['tile_paths'][tile_id]
-                        self.cache[oldest] = Image.open(tile_path)
+                        tile_path = self.tile_paths[tile_id]
+                        try:
+                            self.cache[oldest] = np.array(Image.open(tile_path))
+                        except FileNotFoundError:
+                            print(f"failed to find {tile_path}. Used zeros instead")         
+                            self.cache[oldest] = np.zeros((self.size[1],self.size[2]),dtype=self.dtype)
                         self.tile_ids[oldest] = need_tiles[sn] # record new id for cache possition
                         self.tile_age[oldest] = 0
                         cache_id[still_need[sn]] = oldest
@@ -333,66 +464,115 @@ class mapDiced:
                 
         # Make cache and chunk array        
         self.tile_cache = tileCache(self)
-        self.chunk = np.zeros(self.chunk_list['chunk_size'])
+        self.chunk = np.zeros(self.chunk_list['chunk_shape'])
         
       
     def readChunk(self, chunk_id):
         
         # Grab information from chunk list for chunk_id chunk
-        chunk_size = self.chunk_list['chunk_size']
+        chunk_shape = self.chunk_list['chunk_shape']
         c_tile_rc = self.chunk_list['tile_rc'][chunk_id,:]
         c_tile_id = self.chunk_list['tile_id'][chunk_id,:]
         c_tile_vox = self.chunk_list['tile_vox'][chunk_id,:]
         c_chunk_vox = self.chunk_list['chunk_vox'][chunk_id,:]
         
         # get cache ids for tiles and ask requestTiles to load them into cache
-        good_tile_mask = np.where(c_tile_id>=0,1,0)
-        need_tiles = c_tile_id[good_tile_idx]
+        good_tile_mask = c_tile_id >= 0 #np.where(c_tile_id>=0,1,0)
+        need_tiles = c_tile_id[good_tile_mask]
         self.tile_cache.requestTiles(need_tiles)
         cache_positions = c_tile_id.copy()
-        cache_positions[good_tile_idx] = self.tile_cache.cache_id
+        cache_positions[good_tile_mask] = self.tile_cache.cache_id
         
+             
         # read quarters
-        for r_q in range(2):
-            for c_q in range(1):
-                for zs in range(chunk_size[0]):
-                    cache_id = cache_positions[r_q,c_q,zs]
-                    if tile_id < 0:
-                        break
-                    a = self.cache[cache_id]
-                    [c_tile_vox[r_q, c_q, 0]:[c_tile_vox[r_q, c_q, 1]]
-                     
-                    
-                    
-                    
         
+        for r_q in range(2):
+            for c_q in range(2):
+                zi = [d for d in range(chunk_shape[0])]
+                cis = [int(cache_positions[r_q,c_q,d]) for d in zi]
+                for i,ci in enumerate(cis):
+                    if ci >=0:
+                        try:                             
+                            self.chunk[
+                                i,
+                                c_chunk_vox[r_q, c_q, 0, 0]: c_chunk_vox[r_q, c_q, 0, 1]+1,
+                                c_chunk_vox[r_q, c_q, 1, 0]: c_chunk_vox[r_q, c_q, 1, 1]+1
+                                ] = self.tile_cache.cache[ci][ 
+                                c_tile_vox[r_q, c_q, 0, 0]:c_tile_vox[r_q, c_q, 0, 1]+1,
+                                c_tile_vox[r_q, c_q, 1, 0]:c_tile_vox[r_q, c_q, 1, 1]+1
+                                ]
+                        except TypeError:
+                            print('cache transfer failed')
+        
+    def viewChunk(self, plane = 'None'):
+        
+        
+        chunk_shape = self.chunk_list['chunk_shape']
+        if plane == 'None':
+            show_planes = range(chunk_shape[0])
+        else: 
+            show_planes = [plane]
+               
+        plt.ion()
+        
+        fig_num = plt.get_fignums()
+        if fig_num:
+            fig = plt.figure(fig_num[-1])
+        else:
+            fig = plt.figure()
+        fig.clear()    
+            
+        # fig_manager = plt.get_current_fig_manager()
+        # fig_manager.fig.attributes('-topmost',True)
+        # fig.canvas.manager.window('-topmost', True)
+        
+        
+        fig.ax = fig.add_subplot()
+        fig.ax.img = fig.ax.imshow(np.zeros((chunk_shape[1],chunk_shape[2]),np.uint8), cmap='gray', vmin=0, vmax=255)
+        fig.show()
+                
+        for zs in show_planes:
+              
+            test_image = np.squeeze(self.chunk[zs,:,:].astype(np.uint8))      
+            fig.ax.img.set_data(np.squeeze(test_image))
 
-diced_dir = "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/"
-md = mapDiced(diced_dir,[1],[400])
-md.fetchList([600,25000, 35000], 32, 1024, 1024)
-md.chunkList([16,256,256],[8, 128, 128])
-md.prepareToReadChunks()
-
-chunk = md.readChunk(0)
-
-
-for i in range(md.chunk_list['num_chunk']):
-
-    chunk = md.readChunk(md.chunk_list,i)
+            fig.canvas.flush_events()
+            fig.canvas.draw()
+            plt.pause(.1)  
 
 
 
-  
-tile_id = 0
-tile_path = md.fetch_list['tile_paths'][tile_id]
 
-tile_path = "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/671/1/5_46.png"
-
-img = Image.open(tile_path)
-plt.imshow(img)
- 
+if __name__ == "__main__": #test
 
 
+
+    plt.ion()
+    fig = plt.figure
+    
+    
+    fd_request = {
+        "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
+        "mip_level": 1,
+        "analyze_section": [400], 
+        "volume_lower_corner_zyx": [600, 25000, 35000],
+        "volume_size_zyx": [32, 1024, 1024],
+        "chunk_shape_zyx": [16, 256, 256],
+        "chunk_overlap": [8, 128, 128]
+        }
+    
+    
+    fd = fetchDiced(fd_request)
+    
+    if 1: # test fetching
+        for i in range(fd.chunk_list['num_chunk']):
+            
+            print(f"fetching chunk {i}")
+            fd.readChunk(i)
+            fd.viewChunk()
+            print('finished fetching chunk')
+            #wait = input("press Enter to continue")
+    
 
 
 

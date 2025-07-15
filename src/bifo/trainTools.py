@@ -48,6 +48,14 @@ class showTrainingProgress:
             
             uP = DummyUP()       
         
+        
+        fig_num = plt.get_fignums()
+        if fig_num:
+            self.fig = plt.figure(fig_num[-1])
+        else:
+            self.fig = plt.figure()
+        self.fig.clear()  
+        
         #Set up plots
         self.fig = plt.figure(figsize=(18,6))
         self.sp1 = self.fig.add_subplot(1,3,1)

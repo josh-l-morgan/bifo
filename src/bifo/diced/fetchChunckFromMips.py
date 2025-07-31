@@ -3,14 +3,68 @@
 Created on Fri Jul 11 10:47:40 2025
 
 @author: jlmorgan
+
+You have a large image volume diced into 2D tiles at multiple resolutions
+You want to retrieve some or all of that image volume
+But you only want to retrieve it one 3D chunk at a time
+
+fetchDiced produces a list of chunks that will retrieve the requested
+3D window from a diced image volume
+
+
 """
 
 import os
 import numpy as np
 import re
-from PIL import Image, ExifTags
+from PIL import Image
 import matplotlib.pyplot as plt
+import bifo.tools.voxTools as vt
 
+class tileCache:
+    def __init__(self,md):
+        
+        csh_num = 2048
+        
+        self.size = [csh_num, md.tile_size, md.tile_size] # how many tiles to hold in memory
+        self.dtype = 'float32'
+        self.cache = ['' for i in range(csh_num)]
+        self.tile_ids = np.zeros(csh_num,int)-1
+        self.tile_paths = md.fetch_list['tile_paths']
+        self.tile_age = np.zeros(csh_num)
+        
+    def requestTiles(self,need_tiles):
+        
+        self.tile_age = self.tile_age + 1
+        cache_id = np.zeros(need_tiles.shape[0])-1
+        for i in range(need_tiles.shape[0]):
+            tile_targ = np.where(self.tile_ids == need_tiles[i])[0]
+            if tile_targ.shape[0] > 0:
+                cache_id[i] = tile_targ[0]
+        
+        # if we need to load new tiles
+        still_need = np.where(cache_id<0)[0]
+
+        if  still_need.shape[0]>0:
+            keep = np.isin(self.tile_ids,need_tiles)
+            loose = ~keep
+            
+            for sn in range(still_need.shape[0]):
+                tile_id = int(need_tiles[still_need[sn]])
+                oldest = np.where(loose & 
+                   (self.tile_age == self.tile_age[loose].max()))[0][0]                    
+                tile_path = self.tile_paths[tile_id]
+                try:
+                    self.cache[oldest] = np.array(Image.open(tile_path))
+                except FileNotFoundError:
+                    if 0:
+                        print(f"failed to find {tile_path}. Used zeros instead")         
+                    self.cache[oldest] = np.zeros((self.size[1],self.size[2]),dtype=self.dtype)
+                self.tile_ids[oldest] = need_tiles[sn] # record new id for cache possition
+                self.tile_age[oldest] = 0
+                cache_id[still_need[sn]] = oldest
+        
+        self.cache_id = cache_id
     
 class fetchDiced:
     """
@@ -23,14 +77,16 @@ class fetchDiced:
                
         Standard Example: 
             map_request = {
-                "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
-                "mip_level": 1,
-                "analyze_section": [400], 
-                "volume_lower_corner_zyx": [600,25000, 35000],
-                "volume_size_zyx": [32, 1024, 1024],
-                "chunk_shape_zyx": [16, 256, 256],
-                "chunk_overlap": [8, 128, 128],
+               "diced_dir": paths['diced_dir'], # path to diced data
+               "mip_level": 1, # mip level to retrieve
+               "analyze_section": [0], #Section from which to collect tile information 
+               "volume_lower_corner_zyx": [0,0,0], # lower corner of requested volume in mip_level space 
+               "volume_size_zyx": [4, 256, 256], # size of volume at mip level to be processed
+               "chunk_shape_zyx": [16, 256, 256], # shape of chunks 
+               "chunk_overlap": [8, 128, 128],
+               'full_data_shape': [1400, 72000, 50400]
                 }
+                    
             
             fd = fetchDiced(map_request)
             for i in range(fd.num_chunk)
@@ -57,6 +113,10 @@ class fetchDiced:
         self.findSections()  
         #self.mapMipDirs()
         self.getTileMetadata()
+        self.window_to_list()
+        
+    def window_to_list(self):
+        
         self.findValidCorners()        
         self.fetchList()
         self.chunkList()
@@ -142,17 +202,17 @@ class fetchDiced:
                     
     def findValidCorners(self):
         
-
         mr = self.map_request        
         use_mip = np.array(mr['mip_level'],int)
         volume_zyx = np.array(mr['volume_size_zyx'],int)
         fov_corner_1 = np.array(mr["volume_lower_corner_zyx"])
         fov_corner_1[1:] = np.round(fov_corner_1[1:]/(2 ** use_mip)).astype(int)
         fov_corner_2 = fov_corner_1 + np.array(volume_zyx) -1
-                
-        furthest_vox = (mr["volume_lower_corner_zyx"] + mr["volume_size_zyx"] + mr['chunk_shape_zyx']) * 2
         chunk_shape = np.array(mr['chunk_shape_zyx'])
-        raw_overlap = np.array(mr['chunk_overlap'])
+        raw_overlap = np.array(mr['chunk_overlap'])       
+        
+        furthest_vox = (fov_corner_1 + volume_zyx + chunk_shape) * 2
+        
         
         clp = np.round(raw_overlap/2).astype(int)
         overlap = clp * 2
@@ -190,7 +250,6 @@ class fetchDiced:
     def fetchList(self):
             
         v = self.valid
-        overlap = v['overlap']
         chunk_shape = v['chunk_shape']
                 
         tile_size = self.tile_size
@@ -259,7 +318,6 @@ class fetchDiced:
         tile_size = self.tile_size
         chunk_shape = v['chunk_shape']
         clipped_shape = v['clipped_shape']
-        overlap = v['overlap']
         clp = v['clip']
         list_ok = 'true'
         
@@ -291,7 +349,6 @@ class fetchDiced:
         corners_vox_2 = np.copy(corners_2)
         corners_tile_2[:,1:] = np.floor(corners_2[:,1:] / tile_size)
         corners_vox_2[:,1:] = np.remainder(corners_2[:,1:], tile_size)
-        
         
         
         # create four tile -> chunck index mappings for each chunk, chunk quarters
@@ -347,41 +404,52 @@ class fetchDiced:
 
                                
                         
-        # Test mapping logic, all references should add up to chunk size
-        count_chunk_vox_rc = np.zeros([num_chunk,2])
-        count_tile_vox_rc = np.zeros([num_chunk,2])
-        count_same_t = np.zeros([num_chunk,2])
-        for i in range(num_chunk):
-            for d in range(2):
-                for r_q in range(2):
-                    for c_q in range(2):
+        # # Test mapping logic, all references should add up to chunk size
+        # count_chunk_vox_rc = np.zeros([num_chunk,2])
+        # count_tile_vox_rc = np.zeros([num_chunk,2])
+        # count_same_t = np.zeros([num_chunk,2])
+        # for i in range(num_chunk):
+        #     for d in range(2):
+        #         for r_q in range(2):
+        #             for c_q in range(2):
             
-                        if tile_rc[i,r_q,c_q,d]>0:
-                            count_tile_vox_rc[i,d] = count_tile_vox_rc[i,d]  + tile_vox[i,r_q,c_q,d,1] - tile_vox[i,r_q,c_q,d,0] + 1
-                            count_chunk_vox_rc[i,d] = count_chunk_vox_rc[i,d]  + chunk_vox[i,r_q,c_q,d,1] - chunk_vox[i,r_q,c_q,d,0] + 1
+        #                 if tile_rc[i,r_q,c_q,d]>0:
+        #                     count_tile_vox_rc[i,d] = count_tile_vox_rc[i,d]  + tile_vox[i,r_q,c_q,d,1] - tile_vox[i,r_q,c_q,d,0] + 1
+        #                     count_chunk_vox_rc[i,d] = count_chunk_vox_rc[i,d]  + chunk_vox[i,r_q,c_q,d,1] - chunk_vox[i,r_q,c_q,d,0] + 1
             
-        bad_tile_count = np.sum(count_tile_vox_rc != (chunk_shape[1]))   
-        bad_chunk_count = np.sum(count_chunk_vox_rc != (chunk_shape[1]))   
+        # bad_tile_count = np.sum(count_tile_vox_rc != (chunk_shape[1]))   
+        # bad_chunk_count = np.sum(count_chunk_vox_rc != (chunk_shape[1]))   
         
-        if any(((bad_tile_count>0),(bad_chunk_count>0))):
-            print('bad reference vox numbers')
-            list_ok = 'false'
+        # if any(((bad_tile_count>0),(bad_chunk_count>0))):
+        #     print('bad reference vox numbers')
+        #     list_ok = 'false'
   
         # Find ids for tiles
         fl_zrc = fl['tile_zrc_array']
         tile_id = np.zeros([num_chunk,2,2,chunk_shape[0]])-1 #tile id in quart space of chunck, row, colum, z
+        tile_lookup = {(int(z), int(r), int(c)): i for i, (z, r, c) in enumerate(fl_zrc)}
         for i in range(num_chunk):
             for r_q in range(2):
                 for c_q in range(2):
-                    is_r = (fl_zrc[:,1] == tile_rc[i,r_q,c_q,0])
-                    is_c = (fl_zrc[:,2] == tile_rc[i,r_q,c_q,1])
+                    r = int(tile_rc[i, r_q, c_q, 0])
+                    c = int(tile_rc[i, r_q, c_q, 1])
                     for zs in range(chunk_shape[0]):
-                        is_z = fl_zrc[:,0] == tile_zs[i,zs]
-                        targ_tile = np.where( is_z & is_r & is_c)[0]
-                        if targ_tile.shape[0] == 0:
-                            tile_id[i,r_q,c_q,zs] = -1 
-                        else:
-                            tile_id[i,r_q,c_q,zs] = targ_tile[0]
+                        z = int(tile_zs[i, zs])
+                        tile_id[i, r_q, c_q, zs] = tile_lookup.get((z, r, c), -1)
+
+        # for i in range(num_chunk):
+        #     print(i)
+        #     for r_q in range(2):
+        #         for c_q in range(2):
+        #             is_r = (fl_zrc[:,1] == tile_rc[i,r_q,c_q,0])
+        #             is_c = (fl_zrc[:,2] == tile_rc[i,r_q,c_q,1])
+        #             for zs in range(chunk_shape[0]):
+        #                 is_z = fl_zrc[:,0] == tile_zs[i,zs]
+        #                 targ_tile = np.where( is_z & is_r & is_c)[0]
+        #                 if targ_tile.shape[0] == 0:
+        #                     tile_id[i,r_q,c_q,zs] = -1 
+        #                 else:
+        #                     tile_id[i,r_q,c_q,zs] = targ_tile[0]
                             
         self.num_chunk = num_chunk                  
         self.chunk_list = {
@@ -401,53 +469,6 @@ class fetchDiced:
         }
         
     def prepareToReadChunks(self):
-            
-        class tileCache:
-            def __init__(self,md):
-                
-                csh_num = 2048
-                
-                self.size = [csh_num, md.tile_size, md.tile_size] # how many tiles to hold in memory
-                self.dtype = 'float32'
-                self.cache = ['' for i in range(csh_num)]
-                self.tile_ids = np.zeros(csh_num,int)-1
-                self.tile_paths = md.fetch_list['tile_paths']
-                self.tile_age = np.zeros(csh_num)
-                
-            def requestTiles(self,need_tiles):
-                
-                self.tile_age = self.tile_age + 1
-                existing_idx = np.where(np.isin(need_tiles,self.tile_ids))
-                cache_id = np.zeros(need_tiles.shape[0])-1
-                for i in range(need_tiles.shape[0]):
-                    tile_targ = np.where(self.tile_ids == need_tiles[i])[0]
-                    if tile_targ.shape[0] > 0:
-                        cache_id[i] = tile_targ[0]
-                
-                # if we need to load new tiles
-                still_need = np.where(cache_id<0)[0]
-                
-                
-
-                if  still_need.shape[0]>0:
-                    keep = np.isin(self.tile_ids,need_tiles)
-                    loose = ~keep
-                    
-                    for sn in range(still_need.shape[0]):
-                        tile_id = int(need_tiles[still_need[sn]])
-                        oldest = np.where(loose & 
-                           (self.tile_age == self.tile_age[loose].max()))[0][0]                    
-                        tile_path = self.tile_paths[tile_id]
-                        try:
-                            self.cache[oldest] = np.array(Image.open(tile_path))
-                        except FileNotFoundError:
-                            print(f"failed to find {tile_path}. Used zeros instead")         
-                            self.cache[oldest] = np.zeros((self.size[1],self.size[2]),dtype=self.dtype)
-                        self.tile_ids[oldest] = need_tiles[sn] # record new id for cache possition
-                        self.tile_age[oldest] = 0
-                        cache_id[still_need[sn]] = oldest
-                
-                self.cache_id = cache_id
                 
         # Make cache and chunk array        
         self.tile_cache = tileCache(self)
@@ -458,7 +479,6 @@ class fetchDiced:
         
         # Grab information from chunk list for chunk_id chunk
         chunk_shape = self.chunk_list['chunk_shape']
-        c_tile_rc = self.chunk_list['tile_rc'][chunk_id,:]
         c_tile_id = self.chunk_list['tile_id'][chunk_id,:]
         c_tile_vox = self.chunk_list['tile_vox'][chunk_id,:]
         c_chunk_vox = self.chunk_list['chunk_vox'][chunk_id,:]
@@ -528,37 +548,82 @@ class fetchDiced:
             plt.pause(.1)  
 
 
+    def full_vol(self):
+        
+        
+        # get info
+        lower = self.map_request["volume_lower_corner_zyx"]
+        mip_level = self.map_request["mip_level"]
+        lower[1:] = lower[1:] / (2 ** mip_level)
+        vol_shape = self.map_request['volume_size_zyx'] 
+        pw = np.array([lower, lower + vol_shape])
+        
+        # make volume
+        vol = np.zeros(vol_shape)
 
-
-if __name__ == "__main__": #test
-
-
-
-    plt.ion()
-    fig = plt.figure
-    
-    
-    fd_request = {
-        "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
-        "mip_level": 1,
-        "analyze_section": [400], 
-        "volume_lower_corner_zyx": [600, 25000, 35000],
-        "volume_size_zyx": [32, 1024, 1024],
-        "chunk_shape_zyx": [16, 256, 256],
-        "chunk_overlap": [8, 128, 128]
-        }
-    
-    
-    fd = fetchDiced(fd_request)
-    
-    if 1: # test fetching
-        for i in range(fd.chunk_list['num_chunk']):
+        # fill volume
+        for c in range(self.chunk_list['num_chunk']):    
             
-            print(f"fetching chunk {i}")
-            fd.readChunk(i)
-            fd.viewChunk()
-            print('finished fetching chunk')
-            #wait = input("press Enter to continue")
+            # read chunks into batch 
+            self.readChunk(c)
+            cw = np.array([self.chunk_list["corners_full_vox_1"][c,:],
+                           self.chunk_list["corners_full_vox_2"][c,:]+1])
+            tr = vt.block_to_window(pw, cw)
+            vol[tr['win'][0,0]:tr['win'][1,0], 
+                tr['win'][0,1]:tr['win'][1,1], 
+                tr['win'][0,2]:tr['win'][1,2]] = \
+                self.chunk[tr['ch'][0,0]:tr['ch'][1,0], 
+                    tr['ch'][0,1]:tr['ch'][1,1], 
+                    tr['ch'][0,2]:tr['ch'][1,2]]
+                
+        return vol
+            
+            
+    def vast_to_map_request(map_request,
+            vast_location=(15163, 15397, 373),
+            check_size=[4, 256, 256]
+            ):
+       
+        fov_center = np.array(vast_location) 
+        fov_center = fov_center[[2,1,0]]
+        fov_corner_1 = fov_center - (np.array(check_size) * map_request['mip_level'] / 2) # find lower corner
+    
+        map_request["volume_lower_corner_zyx"] = fov_corner_1.astype(int)
+        map_request['volume_size_zyx'] = check_size
+        
+        return map_request
+
+        
+
+# if __name__ == "__main__": #test
+
+
+
+#     plt.ion()
+#     fig = plt.figure
+    
+    
+#     fd_request = {
+#         "diced_dir": "//storage1.ris.wustl.edu/jlmorgan/Active/morganLab/DATA/LGN_Developing/KxR_P11LGN/diced/",
+#         "mip_level": 1,
+#         "analyze_section": [400], 
+#         "volume_lower_corner_zyx": [600, 25000, 35000],
+#         "volume_size_zyx": [32, 1024, 1024],
+#         "chunk_shape_zyx": [16, 256, 256],
+#         "chunk_overlap": [8, 128, 128]
+#         }
+    
+    
+#     fd = fetchDiced(fd_request)
+    
+#     if 1: # test fetching
+#         for i in range(fd.chunk_list['num_chunk']):
+            
+#             print(f"fetching chunk {i}")
+#             fd.readChunk(i)
+#             fd.viewChunk()
+#             print('finished fetching chunk')
+#             #wait = input("press Enter to continue")
     
 
 

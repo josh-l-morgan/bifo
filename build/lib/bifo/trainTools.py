@@ -43,10 +43,14 @@ class showTrainingProgress:
    
     def __init__(self, uP=None):
         if uP is None:
-            class DummyUP:
-                xs = 256
-            
-            uP = DummyUP()       
+            uP = {'xs': 256}
+        
+        fig_num = plt.get_fignums()
+        if fig_num:
+            self.fig = plt.figure(fig_num[-1])
+        else:
+            self.fig = plt.figure()
+        self.fig.clear()  
         
         #Set up plots
         self.fig = plt.figure(figsize=(18,6))
@@ -54,9 +58,9 @@ class showTrainingProgress:
         self.sp2 = self.fig.add_subplot(1,3,2)
         self.sp3 = self.fig.add_subplot(1,3,3)
         
-        self.im1 = self.sp1.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
-        self.im2 = self.sp2.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
-        self.im3 = self.sp3.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
+        self.im1 = self.sp1.imshow(np.zeros((uP['xs'],uP['xs'])), cmap='gray', vmin=0, vmax=1)
+        self.im2 = self.sp2.imshow(np.zeros((uP['xs'],uP['xs'])), cmap='gray', vmin=0, vmax=1)
+        self.im3 = self.sp3.imshow(np.zeros((uP['xs'],uP['xs'])), cmap='gray', vmin=0, vmax=1)
         
         self.sp1.set_title("Input")
         self.sp2.set_title("Target")
@@ -114,13 +118,31 @@ class showTrainingProgress:
 
 
 def pickTargetOrLastFileID(checkpoint_dir,start_checkpoint_itteration):
-    # Find either the last file in a folder or the file identified by the second input
-    # The file itteration is defined by the last digit in the file name
-    # Enter 'new' to return an empty '' path
-    # If no second input is give, the maximum file ID will be returned
+    """
+    Find either the last file in a folder or the file identified by the second input
+    The file itteration is defined by the last digit in the file name
+    Enter 'new' to return an empty '' path
+    If no second input is give, the maximum file ID will be returned
+
+    Parameters
+    ----------
+    checkpoint_dir : string
+        DESCRIPTION.
+    start_checkpoint_itteration : int
+        if -1, start from beginning.
+
+    Returns
+    -------
+    cp_path : TYPE
+        DESCRIPTION.
+    cp_start_itt : TYPE
+        DESCRIPTION.
+
+    """
+   
     
     # Identify checkpoint path
-    
+    cp_start_itt = 0
     if start_checkpoint_itteration == 'new':
         cp_use_idx = -1 # use impossible
     else:
@@ -154,6 +176,7 @@ def pickTargetOrLastFileID(checkpoint_dir,start_checkpoint_itteration):
         cp_start_itt = numbers[cp_use_idx]
     else:
         cp_path = ''
+        cp_start_itt = 0
         
     return cp_path, cp_start_itt
 

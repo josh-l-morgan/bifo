@@ -1,0 +1,12 @@
+VAST is segmentation software written by Daniel Berger
+The Morgan lab EM analysis pipeline includes exports of VAST segmentations to mat files. 
+
+
+vast_to_zarr - Is an example script that includes all of steps to turning vastSubs into a zarr file
+
+readMergeMats.py converts these files to python friendly files: obI.pkl and vast_subs.h5
+
+	
+vastSubs.mat are n x 3 lists of voxels in the order y x z
+obI.mat is a matlab structure containing information about the segmentations that have been parsed using color tags
+

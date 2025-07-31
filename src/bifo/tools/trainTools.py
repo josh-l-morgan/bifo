@@ -21,34 +21,33 @@ def cropTensor(raw_tensor,ct):
 
         cropped_tensor = []
         for rt in raw_tensor:
-            start = ct
+           
             end = torch.tensor(rt.shape) - torch.tensor(ct)
-            cropped_t = rt[*(slice(s, e) for s, e in zip(start, end))]       
-            #cropped_t = raw_tensor[ct[0]:-end[0],ct[1]:-end[1],ct[2]:-end[2],ct[3]:-end[3],ct[4]:-end[4]]
+            cropped_t = rt[tuple(slice(s, e) for s, e in zip(ct, end))]       
+            #cropped_t = raw_tensor[ct[0]:end[0],ct[1]:end[1],ct[2]:end[2],ct[3]:end[3],ct[4]:end[4]]
             cropped_tensor.append(cropped_t)
         
     else:
-        start = ct
         end = torch.tensor(raw_tensor.shape) - torch.tensor(ct)
-        cropped_tensor = raw_tensor[*(slice(s, e) for s, e in zip(start, end))]     
-        # cropped_tensor = raw_tensor[ct[0]:-ct[0],ct[1]:-ct[1],ct[2]:-ct[2],ct[3]:-ct[3],ct[4]:-ct[4]]
+        cropped_tensor = raw_tensor[tuple(slice(s, e) for s, e in zip(ct, end))]     
+        #cropped_tensor = raw_tensor[ct[0]:-ct[0],ct[1]:-ct[1],ct[2]:-ct[2],ct[3]:-ct[3],ct[4]:-ct[4]]
 
     return cropped_tensor
 
 
-
+def center_window(s1,s2):
+    s1 = np.array(s1)
+    s2 = np.array(s2)
+    
+    lower = (s1 - s2) // 2
+    cap = lower + s2
+    return np.array([lower, cap])
 
 
 class showTrainingProgress:
    
-    def __init__(self, uP=None):
-        if uP is None:
-            class DummyUP:
-                xs = 256
-            
-            uP = DummyUP()       
-        
-        
+    def __init__(self, xs = 256):
+               
         fig_num = plt.get_fignums()
         if fig_num:
             self.fig = plt.figure(fig_num[-1])
@@ -57,20 +56,18 @@ class showTrainingProgress:
         self.fig.clear()  
         
         #Set up plots
-        self.fig = plt.figure(figsize=(18,6))
+        self.fig.set_size_inches((12,8))
         self.sp1 = self.fig.add_subplot(1,3,1)
         self.sp2 = self.fig.add_subplot(1,3,2)
         self.sp3 = self.fig.add_subplot(1,3,3)
         
-        self.im1 = self.sp1.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
-        self.im2 = self.sp2.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
-        self.im3 = self.sp3.imshow(np.zeros((uP.xs,uP.xs)), cmap='gray', vmin=0, vmax=1)
+        self.im1 = self.sp1.imshow(np.zeros((xs,xs)), cmap='gray', vmin=0, vmax=1)
+        self.im2 = self.sp2.imshow(np.zeros((xs,xs)), cmap='gray', vmin=0, vmax=1)
+        self.im3 = self.sp3.imshow(np.zeros((xs,xs)), cmap='gray', vmin=0, vmax=1)
         
         self.sp1.set_title("Input")
         self.sp2.set_title("Target")
         self.sp3.set_title("Prediction")
-
-        
         
         self.fig.show()
     
@@ -118,17 +115,122 @@ class showTrainingProgress:
         return i_cat, i_col
         
                 
+class showTrainingProgress3V:
+   
+    def __init__(self, xs = 256):
+               
+        fig_num = plt.get_fignums()
+        if fig_num:
+            self.fig = plt.figure(fig_num[-1])
+        else:
+            self.fig = plt.figure()
+        self.fig.clear()  
+        
+        #Set up plots
+        self.fig.set_size_inches((12,8))
+        self.ax = []
+        num_ax = 8
+        for a in range(num_ax):
+            self.ax.append(self.fig.add_subplot(2,4,a+1))
+        
+        for a in range(num_ax):
+            self.ax[a].im = self.ax[a].imshow(np.zeros((xs,xs)), cmap='gray', vmin=0, vmax=1)
+        
+        self.ax[3].set_title("Input")
+        self.ax[4].set_title("Target")
+        self.ax[5].set_title("Prediction")
+        
+        self.fig.show()
     
+        
+    def update(self, input_t, pred_t, lab_t=None, show_plane=None):
+      
+        shift_z = []
+        for k in range(3):
+            shift_z.append((input_t[k].shape[2]-input_t[-1].shape[2])//2)
+        
+        midpoints = [round(input_t[k].shape[2]/2) for k in range(len(input_t))]
+        if show_plane is None:
+            showPlane = [midpoints[-1]]
+        elif show_plane == 'all':
+            showPlane = np.arange(input_t[-1].size(2))
+            showPlane = np.concatenate((showPlane[::-1], showPlane[1:midpoints[-1]]))
+        
+        for i in showPlane:        
+            
+            # Ensure everything is on CPU and converted to numpy
+            i_input = []
+            i_pred = []
+            for k in range(len(input_t)):
+                i_input.append(input_t[k][0, 0, i+shift_z[k]].detach().cpu().numpy())
+                if isinstance(pred_t[k], list):
+                    i_pred.append(pred_t[k][-1][0, 0, i+shift_z[k]].detach().cpu().numpy())
+                else:
+                    i_pred.append(pred_t[k][0, 0, i+shift_z[k]].detach().cpu().numpy())
+            
+            if lab_t is None:
+                i_target = [pr * 0 for pr in i_pred]
+            else:
+                i_target = []
+                for k in range(len(input_t)):
+                    i_target.append(lab_t[k][0, 0, i+shift_z[k]].detach().cpu().numpy())
+                        
+            # Normalize
+            for i,inp in enumerate(i_input):
+                i_input[i] = inp/inp.max()
+                
+            for i, pred in enumerate(i_pred):
+                pred = pred - pred .min()
+                pred = pred / (pred.max()+ 1e-8)
+                i_pred[i] = pred
+            
+            # Display
+            for a in range(3):
+                self.ax[a].im.set_data(i_input[a])
+                self.ax[a+4].im.set_data(i_pred[a])
+                self.ax[a].set_title(f'v{a}')
+
+            self.ax[3].im.set_data(i_target[-1])
+            self.ax[3].set_title('labels')
+          
+            self.fig.canvas.flush_events()
+            self.fig.canvas.draw()
+            plt.pause(0.01)   
+            
+        # i_cat = np.concatenate((i_input_2*255/i_input_2.max(), i_target*200, i_pred*255),1)
+        # i_cat = np.uint8(i_cat)
+        # i_col = np.dstack((i_pred*255, i_input_2*255/i_input_2.max(), i_target*200))
+        # i_col = np.uint8(i_col)
+    
+        # return i_cat, i_col    
 
 
 def pickTargetOrLastFileID(checkpoint_dir,start_checkpoint_itteration):
-    # Find either the last file in a folder or the file identified by the second input
-    # The file itteration is defined by the last digit in the file name
-    # Enter 'new' to return an empty '' path
-    # If no second input is give, the maximum file ID will be returned
+    """
+    Find either the last file in a folder or the file identified by the second input
+    The file itteration is defined by the last digit in the file name
+    Enter 'new' to return an empty '' path
+    If no second input is give, the maximum file ID will be returned
+
+    Parameters
+    ----------
+    checkpoint_dir : string
+        DESCRIPTION.
+    start_checkpoint_itteration : int
+        if -1, start from beginning.
+
+    Returns
+    -------
+    cp_path : TYPE
+        DESCRIPTION.
+    cp_start_itt : TYPE
+        DESCRIPTION.
+
+    """
+   
     
     # Identify checkpoint path
-    
+    cp_start_itt = 0
     if start_checkpoint_itteration == 'new':
         cp_use_idx = -1 # use impossible
     else:
@@ -143,7 +245,6 @@ def pickTargetOrLastFileID(checkpoint_dir,start_checkpoint_itteration):
         numbers = [re.findall(r'\d+', s) for s in available_checkpoints]
         numbers = [int(p[-1]) for p in numbers]
         cp_target_idx = [i for i, x in enumerate(numbers) if x == target_idx]
-        
         
         # Find max
         if not numbers:
@@ -162,6 +263,7 @@ def pickTargetOrLastFileID(checkpoint_dir,start_checkpoint_itteration):
         cp_start_itt = numbers[cp_use_idx]
     else:
         cp_path = ''
+        cp_start_itt = 0
         
     return cp_path, cp_start_itt
 
@@ -193,6 +295,32 @@ class gpVaryBrightContrast(gp.BatchFilter):
         batch[self.array_key].spec.dtype = self.dtype  
         return batch
 
+def tr_RF(tr):
+    """
+    Computes receptive field size for a sequential stack of conv layers.
+    
+    layers: list of dicts, each with keys: 'kernel_size', 'stride', 'padding', 'dilation'
+
+    Returns:
+        total_rf: receptive field size
+        total_stride: effective stride
+        total_padding: total padding
+    """
+    rf = 1
+    stride = 1
+    dilation = 1
+
+    for layer in layers:
+        k = layer['kernel_size']
+        s = layer['stride']
+        p = layer['padding']
+        d = layer['dilation']
+
+        rf = rf + ((k - 1) * d) * stride
+        stride *= s
+        dilation *= d
+
+    return rf, stride
 # class uProp():
 
 #     def __init__(self):

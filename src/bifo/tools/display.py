@@ -24,18 +24,11 @@ def col_map(c_type='rand',num_col = 256):
     
 
 class figure:
-    def __init__(self, new=0, num_ax=1):
+    def __init__(self, num_ax=1, fig_name=None):
         
-        if new:
-            self.fig = plt.figure(figsize=(8,8))
-        else:                      
-            fig_num = plt.get_fignums()
-            if fig_num:
-                self.fig = plt.figure(fig_num[-1])
-                self.fig.clear()
-            else:
-                self.fig = plt.figure(figsize=(8,8))
-        
+        self.fig = plt.figure(figsize=(8,8), num=fig_name)
+        self.fig.clear() 
+          
         self.ax = []
         ax_rows = np.floor(num_ax ** (1/2))
         ax_cols = np.ceil(num_ax/ax_rows)
@@ -43,6 +36,9 @@ class figure:
             self.ax.append(self.fig.add_subplot(int(ax_rows), int(ax_cols), a+1))
 
     def update(self):
+        for a in self.ax:
+            a.relim()
+            a.autoscale_view()
         self.fig.canvas.flush_events()
         self.fig.canvas.draw()
         plt.pause(0.001) 
@@ -52,6 +48,18 @@ class figure:
         self.ax[ax_id].clear()
         self.ax[ax_id].img = self.ax[ax_id].imshow(
             blank, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='none')
-        
+
+
+def raise_window(figname=None):
+    """
+    Raise the plot window for Figure figname to the foreground.  If no argument
+    is given, raise the current figure.
+    This function will only work with a Qt graphics backend.  It assumes you
+    """
+
+    if figname: plt.figure(figname)
+    cfm = plt.get_current_fig_manager()
+    cfm.window.activateWindow()
+    cfm.window.raise_()
    
     

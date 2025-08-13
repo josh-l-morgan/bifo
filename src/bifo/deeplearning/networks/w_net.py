@@ -32,6 +32,28 @@ def upsample_tensor(tensor, scale_factors = [1, 2, 2]):
    
     return tensor
 
+
+# class AnisoVGGBlock(nn.Module):
+#     def __init__(self, in_channels, middle_channels, out_channels):
+#         super().__init__()
+#         self.relu = nn.ReLU(inplace=True)
+#         self.conv1 = nn.Conv3d(in_channels, middle_channels, (1, 3, 3), padding=(0, 1, 1))
+#         self.bn1 = nn.BatchNorm3d(middle_channels)
+#         self.conv2 = nn.Conv3d(middle_channels, out_channels, (1, 3, 3), padding=(0, 1, 1))
+#         self.bn2 = nn.BatchNorm3d(out_channels)
+
+#     def forward(self, x):
+#         out = self.conv1(x)
+#         out = self.bn1(out)
+#         out = self.relu(out)
+
+#         out = self.conv2(out)
+#         out = self.bn2(out)
+#         out = self.relu(out)
+
+#         return out
+
+
 class conVGGBlock(nn.Module):
     def __init__(self, in_channels, middle_channels, out_channels,con_shape):
         super().__init__()
@@ -54,6 +76,27 @@ class conVGGBlock(nn.Module):
         return out
 
 
+# class IsoVGGBlock(nn.Module):
+#     def __init__(self, in_channels, middle_channels, out_channels):
+#         super().__init__()
+#         self.relu = nn.ReLU(inplace=True)
+#         self.conv1 = nn.Conv3d(in_channels, middle_channels, 3, padding=1)
+#         self.bn1 = nn.BatchNorm3d(middle_channels)
+#         self.conv2 = nn.Conv3d(middle_channels, out_channels, 3, padding=1)
+#         self.bn2 = nn.BatchNorm3d(out_channels)
+
+#     def forward(self, x):
+#         out = self.conv1(x)
+#         out = self.bn1(out)
+#         out = self.relu(out)
+
+#         out = self.conv2(out)
+#         out = self.bn2(out)
+#         out = self.relu(out)
+
+#         return out
+
+
 def crop_center(x, shape):
     """Crop x (B, C, D, H, W) to shape=(D,H,W) centered."""
     _, _, d, h, w = x.shape
@@ -66,11 +109,11 @@ def crop_center(x, shape):
 
 class NestedUNet(nn.Module):
     def __init__(self, num_classes=1, input_channels=1, deep_supervision=True, 
-                 nb_filter=[16, 32, 64, 128], is_iso=(0,0,1,1), **kwargs):
+                 nb_filter=[16, 32, 64, 128], is_iso=(0,0,1), **kwargs):
         super().__init__()
 
         con_shape = []
-        pool_shape = [(1, 1, 1)] ## blank pool spacer for c0
+        pool_shape = []
         for c in is_iso:
             if c:
                 con_shape.append((3, 3, 3))
@@ -82,9 +125,9 @@ class NestedUNet(nn.Module):
 
         self.deep_supervision = deep_supervision
 
-        self.pool1 = nn.MaxPool3d(kernel_size=pool_shape[1], stride=pool_shape[1], padding=(0, 0, 0))
-        self.pool2 = nn.MaxPool3d(kernel_size=pool_shape[2], stride=pool_shape[2], padding=(0, 0, 0))
-        self.pool3 = nn.MaxPool3d(kernel_size=pool_shape[3], stride=pool_shape[3], padding=(0, 0, 0))
+        self.pool1 = nn.MaxPool3d(kernel_size=pool_shape[0], stride=pool_shape[0], padding=(0, 0, 0))
+        self.pool2 = nn.MaxPool3d(kernel_size=pool_shape[0], stride=pool_shape[0], padding=(0, 0, 0))
+        self.pool3 = nn.MaxPool3d(kernel_size=pool_shape[0], stride=pool_shape[0], padding=(0, 0, 0))
       
         self.up = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=True)
 
@@ -155,66 +198,62 @@ class threeScaleNestedUNet(nn.Module):
         nb_filters = tr['nb_filters']
         v_shapes = np.array(tr['v_shapes'])
         vox_sizes = np.array(tr['vox_sizes'])
-        input_channels = np.array(tr['input_channels']).astype(int)
-        use_supervision = tr['use_supervision']
-        
         is_iso = tr['is_iso']
         output_channels = np.array(tr['output_channels'])
+        ds_0 = vox_sizes[0] / vox_sizes[1]
+        ds_1 = vox_sizes[1] / vox_sizes[2]
+        pull_0 = v_shapes[1] / ds_0
+        pull_1 = v_shapes[2] / ds_1
         
-        num_drops = len(vox_sizes)-1 
-        ds = [np.zeros(3)] * num_drops
-        pull = [np.zeros(3)] * num_drops
-        for d in range(len(vox_sizes)-1):
-            ds[d] = vox_sizes[d] / vox_sizes[d+1]
-            pull[d] = v_shapes[d+1] / ds[d]
+       
+
+        # Stage v0: Large FOV, small channels
+        self.v0 = NestedUNet(num_classes = output_channels[0], 
+                             input_channels=1, nb_filter=nb_filters[0], 
+                             deep_supervision=False, is_iso=is_iso[0])
+
+        # Stage v1: Mid FOV, mid channels (raw + v1_out)
+        self.v1 = NestedUNet(num_classes = output_channels[1], 
+                             input_channels=output_channels[0]+1, 
+                             nb_filter=nb_filters[1], deep_supervision=False, is_iso=is_iso[1])
+
+        # Stage v2: Small FOV, large channels (raw + v2_out)
+        self.v2 = NestedUNet(num_classes = output_channels[2],  
+                             input_channels=output_channels[1]+1, 
+                             nb_filter=nb_filters[2], deep_supervision=True, is_iso=is_iso[2])
         
-        # build multiple u nets
-        self.v = nn.ModuleList()
-        for u in tr['use_u']:
-            self.v.append(NestedUNet(num_classes = output_channels[u], 
-                                 input_channels=input_channels[u], nb_filter=nb_filters[u], 
-                                 deep_supervision=use_supervision[u], is_iso=is_iso[u]))
-            
         self.p = {
            'nb_filters': nb_filters,
            'v_shapes': v_shapes,
            'vox_sizes': vox_sizes,
-           'ds': ds,
-           'pull': pull,
-           'output_channels': output_channels,
-           'input_channels': input_channels
+           'ds_0': ds_0,
+           'ds_1': ds_1,
+           'pull_0': pull_0,
+           'pull_1': pull_1,
+           'output_channels': output_channels
            }
         
 
-    def forward(self, input_tensor, use_v=None):
+    def forward(self, input_tensor):
         """
-        raw: Tensor of shape (B, C, D, H, W)
+        raw: Tensor of shape (B, 1, D, H, W)
         """
-        if use_v is None:
-            
-            in_tensor = input_tensor[0]
-            num_tensor = len(input_tensor)
-            out = []
-            if num_tensor>1:
-                out_core = [] ## lists for cutting center out of output for next phase
-                out_core_u = [] ## list for upsampled centers
-                
-            for t in range(num_tensor):
-                out.append(self.v[t](in_tensor)) ## run model on input tensor
-                if (num_tensor > 1) & (t < (num_tensor-1)):
-                    out_core.append(crop_center(out[t], self.p['pull'][t]))
-                    out_core_u.append(upsample_tensor(out_core[t], self.p['ds'][t]))
-                    in_tensor = torch.cat([input_tensor[t+1], out_core_u[t]], dim=1)
+       
+        ### --- Stage v1 ---
+        out0 = self.v0(input_tensor[0])
+        out0_core = crop_center(out0, self.p['pull_0'])
+        out0_core_u = upsample_tensor(out0_core, self.p['ds_0'])
+        
+        ### --- Stage v2 ---        
+        x_v1 = torch.cat([input_tensor[1], out0_core_u], dim=1)
+        out1 = self.v1(x_v1)
+        out1_core = crop_center(out1, self.p['pull_1'])
+        out1_core_u = upsample_tensor(out1_core, self.p['ds_1'])
+
+        ### --- Stage v3 ---
+        x_v2 = torch.cat([input_tensor[2], out1_core_u], dim=1)
+        out2 = self.v2(x_v2)
+
+        return [out0, out1, out2]  # full supervision or final output
     
-            return out  # full supervision or final output
-        
-        else:   
-            out =  self.v[use_v](input_tensor[0]) ## run model on input tensor
-            return out
-        
-
-
-
-
-
-
+    

@@ -6,6 +6,7 @@ Created on Fri Jul 18 15:59:48 2025
 """
 import numpy as np
 from scipy.stats import mode
+import torch
 
 def is_in3(sub, lower, cap = None):
     if cap is None:
@@ -15,6 +16,14 @@ def is_in3(sub, lower, cap = None):
              (sub[:,1] >= lower[1]) & (sub[:,1] < cap[1]) & \
              (sub[:,2] >= lower[2]) & (sub[:,2] < cap[2])
     return is_in
+
+def is_in_win(sub, win):
+    # upper inclusive
+    is_in = sub[:,0] *  0 + 1
+    for d in range(sub.shape[1]):
+        is_in = is_in * (sub[:,d] >= win[0,d]) * (sub[:,d] < win[1,d])
+    return is_in
+
 
 def is_in1(sub, lower, cap=None):
     if cap is None:
@@ -112,7 +121,7 @@ def block_to_window(pw,cw):
     c_cp = z_cp - cw[0,:]
     
     t_shape = c_cp - c_lw
-    has_data = t_shape.sum()>0  
+    has_data = (t_shape<1).sum() == 0  
    
     transfer_info = {'full': np.array([z_lw,z_cp]).astype(int),
             'win': np.array([w_lw, w_cp]).astype(int),
@@ -123,26 +132,71 @@ def block_to_window(pw,cw):
     return transfer_info
 
 def get_chunk(arr, ch):
-    return arr[ch['lower'][0]:ch['cap'][0], 
-               ch['lower'][1]:ch['cap'][1],
-               ch['lower'][2]:ch['cap'][2]]
+    if arr.ndim == ch.shape[1]:
+        return arr[ch['lower'][0]:ch['cap'][0], 
+            ch['lower'][1]:ch['cap'][1],
+            ch['lower'][2]:ch['cap'][2]]
+    else:
+        return arr[ch['lower'][0]:ch['cap'][0], 
+            ch['lower'][1]:ch['cap'][1],
+            ch['lower'][2]:ch['cap'][2],
+            :]
 
 def get_win(arr, win):
-    return arr[win[0,0]:win[1,0], 
+    if arr.ndim == win.shape[1]:
+        return arr[win[0,0]:win[1,0], 
+            win[0,1]:win[1,1],
+            win[0,2]:win[1,2]]
+    else:
+        return arr[win[0,0]:win[1,0], 
                win[0,1]:win[1,1],
-               win[0,2]:win[1,2]]
+               win[0,2]:win[1,2],
+               :]
+    
 
 def put_win(arr1, win1, arr2, win2=None):
-    
     if win2 is None:
-        win2 = np.array([[0, 0, 0], arr2.shape])
+        win2 = np.array([np.zeros(arr2.ndim), arr2.shape]).astype(int)
     
-    arr1[win1[0,0]:win1[1,0], 
-         win1[0,1]:win1[1,1],
-         win1[0,2]:win1[1,2]] = \
-         arr2[win2[0,0]:win2[1,0], 
-              win2[0,1]:win2[1,1],
-              win2[0,2]:win2[1,2]]   
+    if arr1.ndim == win1.shape[1]:
+        arr1[win1[0,0]:win1[1,0], 
+             win1[0,1]:win1[1,1],
+             win1[0,2]:win1[1,2]] = \
+             arr2[win2[0,0]:win2[1,0], 
+                  win2[0,1]:win2[1,1],
+                  win2[0,2]:win2[1,2]]  
+        
+    else:
+        arr1[win1[0,0]:win1[1,0], 
+             win1[0,1]:win1[1,1],
+             win1[0,2]:win1[1,2],
+             :] = \
+             arr2[win2[0,0]:win2[1,0], 
+                  win2[0,1]:win2[1,1],
+                  win2[0,2]:win2[1,2],
+                  :]   
+    
+    if isinstance(arr1, np.ndarray):
+        return arr1
+    
+def array_to_tensor(arr1, win1, arr2, win2=None):
+    if win2 is None:
+        win2 = np.array([np.zeros(arr2.ndim), arr2.shape]).astype(int)
+    
+    ## reformat win to tensor shape
+   
+    full_win1 = np.array([np.zeros(arr1.ndim), np.ones(arr1.ndim)],int)
+    full_win1[:,-win1.shape[1]:] = win1
+    full_win2 =  np.array([np.zeros(arr2.ndim), np.ones(arr2.ndim)],int)
+    full_win2[:,-win2.shape[1]:] = win2
+    
+    slices_1 = tuple(slice(c, s) for c, s in zip(full_win1[0,:], full_win1[1,:]))
+    slices_2 = tuple(slice(c, s) for c, s in zip(full_win2[0,:], full_win2[1,:]))
+    
+    arr1[slices_1] = torch.from_numpy(arr2[slices_2])
+    
+    #return arr1
+    
     
 def downsample_win(win, dsamp):
     
@@ -158,6 +212,26 @@ def downsample_win(win, dsamp):
     lower_ds = np.round(win[0,:] / dsamp)
     win_ds = np.array([lower_ds, lower_ds + shape_ds]).astype(int)
     return win_ds
+
+def upsample_array(arr, usamp):
+    """
+    Upsample a NumPy array by repeating elements 
+
+    Args:
+        arr (np.ndarray): The input array.
+        usamp (list or tuple): List of scale factors, e.g., [1, 2, 2].
+
+    Returns:
+        np.ndarray: The upsampled array.
+    """
+    usamp = np.array(usamp).astype(int).flatten()
+    ndim = arr.ndim
+    nscale = len(usamp)
+
+    for d in range(nscale):
+        arr = np.repeat(arr, usamp[d], axis=d)
+
+    return arr
                  
 def downsample_3d_kernel(arr, dsamp, method='mean'):
     """

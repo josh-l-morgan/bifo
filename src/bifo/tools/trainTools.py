@@ -215,35 +215,24 @@ class showTrainingProgressPts:
   
 
                
-class showTrainingProgress3V:
+class showTrainingProgress3V(dsp.figure):
    
     def __init__(self, tr):
-               
-        fig_num = plt.get_fignums()
-        if fig_num:
-            self.fig = plt.figure(fig_num[-1])
-        else:
-            self.fig = plt.figure()
-        self.fig.clear()  
         
+        super().__init__(num_ax = 9, fig_name='training')   
+       
         #Set up plots
         self.fig.set_size_inches((9,9))
-        self.ax = []
-        num_ax = 9
-        for a in range(num_ax):
-            self.ax.append(self.fig.add_subplot(3,3,a+1))
+      
         
-        for a in range(num_ax):
-            self.ax[a].im = self.ax[a].imshow(np.zeros((256, 256)), cmap='gray', vmin=0, vmax=1)
+        for a in self.ax:
+            a.im = a.imshow(np.zeros((256, 256)), cmap='gray', vmin=0, vmax=1)
         
         self.ax[0].set_title("v0")
         self.ax[1].set_title("v1")
         self.ax[2].set_title("v2")
         
-        self.fig.show()
-    
-        
-    def update(self, input_t, pred_t, lab_t=None, show_plane=None):
+    def show_dat(self, input_t, pred_t, lab_t=None, show_plane=None):
       
         shift_z = []
         for k in range(3):
@@ -291,9 +280,8 @@ class showTrainingProgress3V:
                 self.ax[a+3].im.set_data(i_target[a])
                 self.ax[a].set_title(f'v{a}')
 
-            self.fig.canvas.flush_events()
-            self.fig.canvas.draw()
-            plt.pause(0.01)   
+            self.update()
+            
             
         # i_cat = np.concatenate((i_input_2*255/i_input_2.max(), i_target*200, i_pred*255),1)
         # i_cat = np.uint8(i_cat)
@@ -301,6 +289,23 @@ class showTrainingProgress3V:
         # i_col = np.uint8(i_col)
     
         # return i_cat, i_col    
+
+class show_prev_v3(dsp.figure):
+    def __init__(self):
+        super().__init__(num_ax = 8, fig_name='prev')
+        for a in self.ax:
+            a.img = a.imshow(np.zeros((64, 64)), cmap='grey', vmax=1)
+        self.num_v = 3
+        self.num_c = 4
+
+    def show_dat(self, prev):
+        
+        for vi in range(self.num_v-1):
+            for c in range(self.num_c):
+                mid_point = int(prev[vi].shape[2] // 2)
+                im = prev[vi][0, c, mid_point, :, :].detach().numpy()
+                self.ax[c+ vi * self.num_c].img.set_data(im / 2 + .1)
+        self.update()
 
                 
 class showInferenceProgressV3:
@@ -606,6 +611,7 @@ class CheckValid():
        
         self.param = {'crop_validity': np.array([.68, .95, .999])}
         self.maps = []
+        self.masks
         for mi, m in enumerate(self.test_model):
            
             self.maps.append({})
@@ -619,7 +625,7 @@ class CheckValid():
             border_tensor = border_tensor.repeat(1, tr['input_channels'][mi], 1, 1, 1)
             border_tensor = border_tensor.to(tr['device'])
             border_out = self.test_model[mi](border_tensor)
-            border_map = border_out[-1][0, :].detach().numpy().squeeze()  # if deep supervision
+            border_map = border_out[-1][0, :].detach().cpu().squeeze().numpy()  # if deep supervision
             border_map = border_map[1:-1,1:-1,1:-1]
             self.maps[mi]['min_border_val'] = border_map.min()
             self.maps[mi]['max_border_val'] = border_map.max()
@@ -658,7 +664,7 @@ class CheckValid():
                 else:
                     crops.append([0, 0, 0])
             
-            self.maps[mi]['border_volume'] = border_map.copy()
+            self.masks.append(border_map.copy())
             self.maps[mi]['border_section_yx'] = border_samp_yx.copy()
             self.maps[mi]['border_section_zx'] = border_samp_zx.copy()
             self.maps[mi]['rf_mins'] = rf_min.copy()

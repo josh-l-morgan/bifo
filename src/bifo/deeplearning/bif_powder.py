@@ -16,6 +16,7 @@ import torchvision
 import bifo.tools.display as dsp
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as F
+from bifo.tools.dtypes import ticTocDic
 
 
 class Dataset:
@@ -71,7 +72,9 @@ class BifPowder():
         self.zm = ZarrDictionaryManager(self.tr)
         self.make_requests()
         self.jit = {'do': 0 }
-    
+        self.tk = ticTocDic()
+        self.tk.m(['pull','batchify','augment', 'loss','other'])
+        
     def interpret_train_request(self, train_request):
         tr = copy.deepcopy(train_request)
         
@@ -108,6 +111,7 @@ class BifPowder():
         request['batch_size'] = self.tr['batch_size']
         request['is_input'] = True
         request['vox_sizes']= [np.array([1,1,1])]
+        request['device'] = self.tr['device']
         if self.tr['augment_rotate']:
              request['buf_fac'] = 2 ** (1/2)
         else:
@@ -128,11 +132,10 @@ class BifPowder():
         request['buf_fac'] = buf_frac if buf_frac is not None else request['buf_fac']
         request['vox_sizes'] = self.zm.datasets[source_key].vox_sizes
         
-        
-        if request_type=='zarr':
-            pin_memory = 1
+        if request['device'] == 'cpu':
+            pin_memory=True
         else:
-            pin_memory = 0
+            pin_memory=False
             
         self.pulled_b[request_key] = []
         self.pulled[request_key] = []
@@ -144,13 +147,19 @@ class BifPowder():
             request['pull_shapes'].append(fix_shape.copy().astype(int))
             request['pull_fovs'].append( np.astype(fix_shape * request['vox_sizes'][m],int))
             
-            if pin_memory:
+            if request_type=='zarr':
                 self.pulled_b[request_key].append(torch.empty(
-                    (request['batch_size'], channels, int(targ_shape[0]), int(targ_shape[1]), int(targ_shape[2])), dtype=torch.float32, pin_memory=True))
+                    (request['batch_size'], channels, int(targ_shape[0]), 
+                     int(targ_shape[1]), int(targ_shape[2])), 
+                    dtype=torch.float32, pin_memory=pin_memory, device=request['device']))
                 self.pulled[request_key].append(torch.empty(
-                    (1, channels, int(fix_shape[0]), int(fix_shape[1]), int(fix_shape[2])), dtype=torch.float32, pin_memory=True))
+                    (1, channels, int(fix_shape[0]), int(fix_shape[1]), 
+                     int(fix_shape[2])), dtype=torch.float32, 
+                    pin_memory=pin_memory, device=request['device']))
                 self.pulled_c[request_key].append(torch.empty(
-                    (1, channels, int(targ_shape[0]), int(targ_shape[1]), int(targ_shape[2])), dtype=torch.float32, pin_memory=True))
+                    (1, channels, int(targ_shape[0]), int(targ_shape[1]), 
+                     int(targ_shape[2])), dtype=torch.float32, 
+                    pin_memory=pin_memory, device=request['device']))
                 
             else:
                 self.pulled_b[request_key].append([''] * request['batch_size'])
@@ -172,7 +181,7 @@ class BifPowder():
    
         
     def pull(self):
-        
+        self.tk.b('pull')
         if self.jit['do']:
             self.jitter_pull()
         else:
@@ -197,7 +206,8 @@ class BifPowder():
                             else:
                                     print('data window empty')
                         
-                     
+        self.tk.e('pull')
+            
                         
 
     def random_location(self, mode='full', key='raw', fov_win=None, ref_v=0):
@@ -227,7 +237,7 @@ class BifPowder():
         
         
     def batchify(self, batch_num=0, device='cpu'):
-        
+        self.tk.b('batchify')
         ## perform cropping
         self.crop_pulled() ## schould integrate with batch formation?
         
@@ -239,7 +249,8 @@ class BifPowder():
             else:
                 for mi, m in enumerate(self.pulled_c[k]):
                     self.pulled_b[k][mi][batch_num:batch_num+1,:].copy_(m, non_blocking=False)
-
+        self.tk.e('batchify')
+        
 ### Display
 
     def show_key(self, key, show_plane=None):
@@ -329,26 +340,99 @@ class BifPowder():
         arr2 = arr[slices]
         
         return arr2  
+        
     
+    def upsample_array(self, arr, scale_factors = [1, 2, 2]):
+              
+        # Apply repeat_interleave along each axis in reverse order
+        ndim = arr.ndim
+        scale_factors = np.array(scale_factors).astype(int).flatten()
+        nscale = len(scale_factors)
+        for d in range(nscale):
+            if type(arr) == 'torch.tensor':
+                arr = arr.repeat_interleave(scale_factors[d], dim= ndim-nscale+d)  # 
+            else:
+                arr = arr.repeat(scale_factors[d], axis= ndim-nscale+d)  # 
+       
+        return arr
+                            
+    def downsample_3d_kernel(self, arr, dsamp, method='mean'):
+        """
+        Downsample 3D volume using a 3D kernal with shape = dsamp
+        Source will be expanded so that every voxel is used. Edge voxels that dont 
+        match dsamp will be duplicated so that 
+        final shape = ceiling(source.shape/dsamp)
     
+        Parameters
+        ----------
+        arr : 3D np array
+            DESCRIPTION.
+        dsamp : 3, array 
+            shape of downsample kernel.
+        method : string, optional
+            method of downsampling within dsamp kernel   
+            'mean' = np.mean
+            'max' = np.max
+            'min' = np.min
+            
+        Returns
+        -------
+        arr : 3D np array
+            Downsampled array.
+    
+        """
+        
+        #duplicat edges to fill for downsample
+        raw_shape = np.array(arr.shape)
+        valid_shape = (np.ceil(arr.shape[0]/dsamp[0]) * dsamp[0],
+                     np.ceil(arr.shape[1]/dsamp[1]) * dsamp[1],
+                     np.ceil(arr.shape[2]/dsamp[2]) * dsamp[2])
+        shape_dif = valid_shape - raw_shape
+        arr = np.concatenate((arr,np.repeat(arr[:,raw_shape[1]-1:raw_shape[1],:], shape_dif[1], 1)),1)
+        arr = np.concatenate((arr,np.repeat(arr[:,:,raw_shape[2]-1:raw_shape[2]], shape_dif[2], 2)),2)
+        arr = np.concatenate((arr,np.repeat(arr[raw_shape[0]-1:raw_shape[0],:,:], shape_dif[0], 0)),0)
+        
+        # reshape
+        new_shape = (arr.shape[0]//dsamp[0], dsamp[0],
+                     arr.shape[1]//dsamp[1], dsamp[1],
+                     arr.shape[2]//dsamp[2], dsamp[2])
+    
+        # apply method
+        match method:
+            case 'mean':
+                arr2 = arr.reshape(new_shape).mean(axis=(1, 3, 5))
+            case 'max':
+                arr2 = arr.reshape(new_shape).max(axis=(1, 3, 5))
+            case 'min':
+                arr2 = arr.reshape(new_shape).min(axis=(1, 3, 5))
+                
+        return arr2
+
 
     def affinities(self, key_in, key_out='aff', merge=True, shift = [[1, 1, 1], [1, 1, 1], [1, 1, 1]]):
         """
         Assumes second dim is a channel of shape 1 that is 
         available for stacking affinities
-        treats affinities as channels and adds a 4th merged affinity channel
+        
         """
         
-        for mi, m in enumerate(self.pulled[key_in]):
-            affd = torch.empty((1,4, m.shape[2], m.shape[3], m.shape[4]))
-            ndim = m.ndim
+        for vi in range(self.num_v):
+            affm, affd = self.calc_affinities(self.pulled[key_in][vi], shift[vi])
+            if merge:
+                self.pulled[key_out][vi][:] = affm
+            else:
+                self.pulled[key_out][vi][:] = affd
+            
+    def calc_affinities(self, m, shift):
+            affd = m.new_empty((1,3, m.shape[2], m.shape[3], m.shape[4]))
+            affm = m.new_empty((1,1, m.shape[2], m.shape[3], m.shape[4]))
             m_stable = m.clone() 
             for d in range(3):
-                dif = m_stable -  torch.roll(m, shifts=shift[mi][d], dims=-d)
+                dif = m_stable -  torch.roll(m, shifts=shift[d], dims=-(d+1))
                 affd[0,d,:] = dif == 0 ## add affinity to channel
                 
                 ## reflect
-                affd[0,d,:] = affd[0,d,:] * torch.roll(affd[0,d,:], shifts=-shift[mi][d], dims=-d)
+                affd[0,d,:] = affd[0,d,:] * torch.roll(affd[0,d,:], shifts=-shift[d], dims=-(d+1))
                 affd[0,d,:] = affd[0,d,:]  * (m > 0)
                 
                 ## negate invalid
@@ -362,10 +446,10 @@ class BifPowder():
                 slice2 = tuple(slice(c, s) for c, s in zip(low2, high1))
                 affd[slice1] = 1
                 affd[slice2] = 1
-            affd[:,3,:,:,:] = affd[:,0:3,:,:,:].prod(1) 
-            self.pulled[key_out][mi][:] = affd
-            
-            
+            affm = affd.prod(1) 
+            return affm, affd
+        
+    
     def aff_weights(self, key_in, key_out='aff_wieghts'):
         print('affinity weights not done')
        
@@ -442,15 +526,13 @@ class BifPowder():
             return aug_seg
            
         
-    def gaussian_fft_filter(self, x, sigma_h, sigma_w=None, pad_mult=5, device='cpu'):
-        import torch.fft as tfft
+    def gaussian_fft_filter_tensor(self, x, sigma_h, sigma_w=None, pad_mult=5):
     
         # x: (N, C, H, W), float32
         if sigma_w is None: sigma_w = sigma_h
-        dev, dt = device, torch.float32
-        old_mean = x.mean()
+        dev = x.device
+        dt = x.dtype
         
-    
         # Pad to reduce circular artifacts: ~3σ on each spatial edge
         pad_vec = np.zeros(x.ndim, int)
         pad_vec[-2:] = np.ceil(np.array((sigma_h, sigma_w)) * pad_mult + 0.5).astype(int)
@@ -458,12 +540,9 @@ class BifPowder():
         pad_shape = old_shape + pad_vec
         slices = tuple(slice(c, c + s) for c, s in zip(pad_vec, old_shape))
         
-        xpad = torch.zeros(tuple(pad_shape),dtype=torch.float32) + x.mean()
+        xpad = x.new_zeros(tuple(pad_shape)) + x.mean()
                 
-        if torch.is_tensor(x):
-            xpad[slices] = x
-        else:
-            xpad[slices] = torch.from_numpy(x)
+        xpad[slices] = x
                 
         # Xf is from rfft2(xpad): shape (..., H, W_r)
         Xf = torch.fft.rfft2(xpad)              # (..., H, W_r), W_r = W//2 + 1
@@ -484,48 +563,113 @@ class BifPowder():
         ypad = torch.fft.irfft2(Yf, s=(H, W))
             
         # Crop back
-        if torch.is_tensor(x):
-            y = ypad[slices]
-        else:
-            y = ypad[slices].detach().numpy()
+        y = ypad[slices]
         
         return y
     
-    def blackout(self, key, frequency, magnitude):
+    def gaussian_fft_filter_numpy(self, x, sigma_h, sigma_w=None, pad_mult=5):
     
+        # x: (N, C, H, W), float32
+        if sigma_w is None: sigma_w = sigma_h
+        
+        # Pad to reduce circular artifacts: ~3σ on each spatial edge
+        pad_vec = np.zeros(x.ndim, int)
+        pad_vec[-2:] = np.ceil(np.array((sigma_h, sigma_w)) * pad_mult + 0.5).astype(int)
+        old_shape = np.array(x.shape, int)
+        pad_shape = old_shape + pad_vec
+        slices = tuple(slice(c, c + s) for c, s in zip(pad_vec, old_shape))
+        
+        xpad = np.zeros(tuple(pad_shape)) + x.mean()
+                
+        xpad[slices] = x
+                    
+        # Xf is from rfft2(xpad): shape (..., H, W_r)
+        Xf = np.fft.rfft2(xpad)              # (..., H, W_r), W_r = W//2 + 1
+        
+        H  = xpad.shape[-2]
+        W  = xpad.shape[-1]
+        fy = np.fft.fftfreq(H,  d=1.0)[:, None]     # (H, 1)
+        fx = np.fft.rfftfreq(W, d=1.0)[None, :]     # (1, W_r)
+        
+        # Gaussian frequency response on the rFFT grid: (H, W_r)
+        Hf = np.exp(-(2*torch.pi**2) * ((sigma_h**2)*(fy**2) + (sigma_w**2)*(fx**2)))
+        
+        # Broadcast Hf up to Xf's ndim (prepend singleton dims)
+        while Hf.ndim < Xf.ndim:
+            Hf = Hf.unsqueeze(0)
+        
+        Yf   = Xf * Hf
+        ypad = np.fft.irfft2(Yf, s=(H, W))
+            
+        # Crop back
+        y = ypad[slices]
+                
+        return y
+        
+    
+    def black_blobs(self, key, frequency, magnitude):
+        self.tk.b('augment')
 
         if frequency:
             ag = self.section_augment_info(key, frequency, magnitude)
-            max_fov = np.ceil(ag['max_fov']).astype(int)
-            blob_field = np.zeros((max_fov[1], max_fov[2]),np.float32)
-            
+            source_fov = np.ceil(ag['max_fov']).astype(int)
+            small_fov = np.array([1, 128, 128])
+            scale_factor = np.ceil(source_fov / small_fov)+1
+            big_fov = (small_fov * scale_factor).astype(int)
+            blob_field_big = np.zeros(tuple(big_fov[1:]))
+
             for zi in range(len(ag['r_hit_full'])):
                 sigma = [ag['r_sigs'][zi, 0], ag['r_sigs'][zi, 1] ] 
-                blob_field = np.random.rand(max_fov[1]+int(sigma[0]*6), max_fov[2]+int(sigma[1]*6))
-                #blob_field = self.gaussian_fft_filter(blob_field, sigma[0], sigma[1], pad_mult=0)
-                blob_field = sk.filters.gaussian(
-                    blob_field, 
-                    sigma=sigma,
-                    mode='reflect')
-                
-                blob_mask = (blob_field > .5).astype(np.float32)
-                    
-                for ai in range(len(ag['vox_sizes'])):
+                blob_field = np.random.rand(small_fov[1], small_fov[2])
+                blob_field= self.gaussian_fft_filter_numpy( blob_field, sigma[0], sigma[1], pad_mult=0)
+                blob_field_big[:] = self.upsample_array(blob_field, scale_factor[1:])
+                blob_field_big[:] = self.gaussian_fft_filter_numpy( blob_field_big, scale_factor[1], scale_factor[2], pad_mult=0)
+                blob_mask = np.expand_dims((blob_field_big > .5).astype(np.float32), 0)
+    
+                for ai in range(self.num_v):
                     hit_z = ag['r_hits'][ai][zi] 
                     if hit_z >= 0:
-                        blob_scaled = sk.transform.downscale_local_mean(blob_mask, 
-                                factors= tuple((ag['vox_sizes'][ai,1], ag['vox_sizes'][ai,2])))
+                        blob_scaled = self.downsample_3d_kernel(blob_mask, ag['vox_sizes'][ai], method='mean')
                         blob_pull = self.get_center(arr=blob_scaled, target_shape=ag['shapes'][ai,1:])
-                        # self.pulled[key][ai][0, 0, ag['r_hits'][ai][zi], :, :] = \
-                        #      self.pulled[key][ai][0, 0, ag['r_hits'][ai][zi], :, :] - torch.from_numpy(blob_pull)
-                        blob_tensor = torch.from_numpy(blob_pull)
+                        blob_tensor = torch.from_numpy(blob_pull).to(self.pulled[key][ai])
                         self.pulled[key][ai][0, 0, hit_z, :, :] = self.pulled[key][ai][0, 0, hit_z, :, :] - blob_tensor   
              
                 for ai in range(len(self.pulled[key])):
-                    self.pulled[key][ai][np.where(self.pulled[key][ai]<0)] = 0
-    
+                    self.pulled[key][ai][torch.where(self.pulled[key][ai]<0)] = 0
+        self.tk.e('augment')
+        
+        
+    def black_corner(self, key, frequency):
+        self.tk.b('augment')
+
+        if frequency:
+            ag = self.section_augment_info(key, frequency, 1)
+            source_fov = np.ceil(ag['max_fov']).astype(int)
+            blob_field = np.zeros((1, source_fov[1], source_fov[2]))
+
+            for zi in range(len(ag['r_hit_full'])):
+                blob_field = blob_field * 0
+                mids = np.random.rand(2) * blob_field.shape[1:]
+                edges = (np.random.rand(2) < .5).astype(float) * blob_field.shape[1:]
+                y_rand = np.sort(np.floor([mids[0], edges[0]]).astype(int))
+                x_rand = np.sort(np.floor([mids[1], edges[1]]).astype(int))
+                blob_field[0, y_rand[0]:y_rand[1]+1, x_rand[0]:x_rand[1]+1] = 1
+               
+              
+                for ai in range(self.num_v):
+                    hit_z = ag['r_hits'][ai][zi] 
+                    if hit_z >= 0:
+                        blob_scaled = self.downsample_3d_kernel(blob_field, ag['vox_sizes'][ai], method='mean')
+                        blob_pull = self.get_center(arr=blob_scaled, target_shape=ag['shapes'][ai,1:])
+                        blob_tensor = torch.from_numpy(blob_pull).to(self.pulled[key][ai])
+                        self.pulled[key][ai][0, 0, hit_z, :, :] = self.pulled[key][ai][0, 0, hit_z, :, :] - blob_tensor   
+             
+                for ai in range(len(self.pulled[key])):
+                    self.pulled[key][ai][torch.where(self.pulled[key][ai]<0)] = 0
+        self.tk.e('augment')
+        
     def random_rotate_z(self):
-            
+        self.tk.b('augment')
         angle_deg = np.random.uniform(-180, 180)
         for k in self.pulled:
             if self.requests[k]['request_type']=='points':
@@ -543,17 +687,17 @@ class BifPowder():
                 
                 for mi, m in enumerate(self.pulled[k]):
                     rotate_dim = (m.ndim - 2, m.ndim -1)
-                    self.pulled[k][mi][:] = torch.from_numpy( 
-                        nd_rotate(
-                        m,
+                    arr = nd_rotate(
+                        m.detach().cpu().numpy(),
                         angle=angle_deg,
                         axes=rotate_dim,  # rotate in the XY plane
                         reshape=False,
                         order=1,      # bilinear interpolation
                         mode='constant',
                         cval = 0
-                    ))
-             
+                    ).astype('float32')
+                    self.pulled[k][mi][:] = torch.from_numpy(arr).to(m.device)
+        self.tk.e('augment')
         
     def crop_pulled(self):
         
@@ -573,7 +717,7 @@ class BifPowder():
         Add assymetric gaussian blur to a subset of sections 
         Apply the same destig to corresponding plane in multiscale set of arrays
         """
-       
+        self.tk.b('augment')
         if frequency:
             ag = self.section_augment_info(key, frequency, magnitude)
             
@@ -583,7 +727,7 @@ class BifPowder():
                         sigma = ag['r_sigs'][zi, :] / ag['vox_sizes'][ai][1:]
                         
                         self.pulled[key][ai][0, 0, ag['r_hits'][ai][zi], :, :] \
-                            = self.gaussian_fft_filter(
+                            = self.gaussian_fft_filter_tensor(
                             self.pulled[key][ai][0, 0, ag['r_hits'][ai][zi], :, :],
                             sigma[0], sigma[1])
                       
@@ -593,7 +737,7 @@ class BifPowder():
                         #     sigma=sigma,
                         #     mode='reflect')
                         # self.pulled[key][ai][0, 0, ag['r_hits'][ai][zi], :, :] = torch.from_numpy(arr2)
-                    
+        self.tk.e('augment')
                 
     def jitter(self, key, frequency, magnitude):
         if frequency:
@@ -614,72 +758,337 @@ class BifPowder():
             self.jit['shifts'] = jitters.copy()
             self.jit['do'] = 1
             self.jit['buf'] = jitter_buf.copy()
+            self.jit['shift_planes'] = shift_planes 
         else:
             self.jit['do'] = 0
        
 
     def jitter_pull(self):
-         print('doesnt jitter yet')
-         print("should {self.jit['buf']")
-         for ri, k in enumerate(self.requests.keys()):
-             r = self.requests[k]
-             if r['is_input']:
-                 for mi, m in enumerate(r['use_mips']):
-                     self.pulled[k][mi][:] = 0
-                     pull_corner = self.center_voxes[mi] - r['pull_shapes'][mi] // 2
-                     pull_win = np.array([pull_corner, pull_corner +  r['pull_shapes'][mi]]).astype(int)
-                     source_win = np.array([[0, 0, 0], self.zm.datasets[r['source_key']].shapes[mi]])
-                     transfer = vt.block_to_window(source_win,pull_win)
-                     if transfer['has_data']:
-                         vt.array_to_tensor(self.pulled[k][mi], transfer['ch'], 
-                                    self.zm.datasets[r['source_key']].arr[mi], transfer['win'])
+        print('doesnt jitter yet')
+        print("should {self.jit['buf']")
+    
+        jit_buf = []
+        buf_shape = []
+        pull_corner = []
+        pull_win = []
+        buf_block = []
+        first_key = next(iter(self.requests))
+        print('WARNING. Using default key for jitter shape')
+        for vi in range(self.num_v):
+            jit_buf.append(self.jit['buf'][vi])
+            bigger = np.concatenate((np.zeros(1), jit_buf[-1][1,:] - jit_buf[-1][0,:])).astype(int)
+            buf_shape.append(self.requests[first_key]['pull_shapes'][vi] + bigger)
+            pull_corner.append(np.round(self.center_voxes[vi] - buf_shape[-1] / 2))
+            pull_win.append(np.array([pull_corner[-1], pull_corner[-1] +  buf_shape[-1]]).astype(int))
+            buf_block.append(torch.empty(tuple(buf_shape[vi])))
+    
+        for ri, k in enumerate(self.requests.keys()):
+            request = self.requests[k]
+            if request['is_input']:
+                for vi in range(self.num_v):
+                    if request['request_type']=='points':
+                        pts = self.data['raw_pts'].copy() / request['vox_sizes'][vi]
+                        is_in = np.where(self.pts_in_win(pts, pull_win ))[0] ## select in fov space
+                        pts_in_fov = pts[is_in,:] - (pull_corner )
+                        self.pulled[k][vi] =  pts_in_fov 
+                        print('WARNING, points were not jittered')
+                    else:
+                        buf_block[vi][:] = 0
+                        source_win = np.array([[0, 0, 0], self.zm.datasets[request['source_key']].shapes[vi]])
+                        transfer = vt.block_to_window(pull_win[vi], source_win)
+                        if transfer['has_data']:
+                            vt.array_to_tensor(buf_block[vi], transfer['win'], 
+                                       self.zm.datasets[request['source_key']].arr[vi], transfer['ch'])
+                            for sp in self.jit['shift_planes']:
+                                buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][0], dims=0)
+                                buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][1], dims=1)
+                            self.pulled[k][vi][:] = buf_block[vi][:,
+                                -jit_buf[vi][0,0]:-jit_buf[vi][0,0] + request['pull_shapes'][vi][1], 
+                                -jit_buf[vi][0,1]:-jit_buf[vi][0,1] + request['pull_shapes'][vi][2]] 
+                                
+                        else:
+                                print('data window empty')
+                    
+    
+    
+    ## Model manipulations
+    
+    def wack_weights():
+        print('fix wack_weights')
+        # if 0:
+        #     with torch.no_grad():
+        #             print("Before:", model.v[0].conv0_0.conv1.weight.view(-1)[0])
+        #             #model.v[0].apply(manual_reinit)
+        # elif 0:
+        #     with torch.no_grad():
+        #         for p in model.v[0].parameters():
+        #             p.add_(.1 * torch.randn_like(p))
+        #     print("After:", model.v[0].conv0_0.conv1.weight.view(-1)[0])
+        # else:
+        #     optimizer = torch.optim.AdamW(lr=0.7e-4, params=model.parameters(), weight_decay=0.7e-4)
+    
+        # tr['wack_weights'] = 1
+    
+    
+    def manual_reinit(m):
+        print('fix manual_reinit')
+        # if isinstance(m, nn.Conv3d):
+        #     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        #     if m.bias is not None:
+        #         nn.init.zeros_(m.bias)
+        # elif isinstance(m, nn.BatchNorm3d):
+        #     nn.init.ones_(m.weight)
+        #     nn.init.zeros_(m.bias)
+        # elif isinstance(m, nn.Linear):
+        #     nn.init.kaiming_normal_(m.weight, mode='fan_out')
+        #     if m.bias is not None:
+        #         nn.init.zeros_(m.bias)
+        # elif isinstance(m, nn.Module):
+        #     # This ensures nested blocks like conVGGBlock are reached
+        #     for child in m.children():
+        #         manual_reinit(child)
 
 
-## Model manipulations
+    def make_loss_masks(self):
+        
+        self.loss_masks = [None] * self.num_v
+        
+        if self.tr['loss_mask_type'] == 'hard':
+            for vi in range(self.num_v):
+                loss_masks = self.cropping_mask(self.tr['v_shapes'][vi], self.tr['v_crop'][vi])
+                self.loss_masks[vi] = torch.from_numpy(loss_masks, device=self.tr['device'])
+        elif self.tr['loss_mask_type'] == 'soft':
+            for vi in range(self.num_v):
+                self.loss_masks[vi] = torch.from_numpy(self.cvv.masks[vi]).to(self.tr['device'])
+                            
+    def masked_bce_with_logits(self, logits, target, mask=None):
+        """
+        logits, target, mask: broadcastable to (B, 1, D, H, W) or (B, C, D, H, W)
+        mask should be float {0,1}. Booleans are fine; they’ll be cast.
+        """
+        
+        if mask is None:
+            mask = torch.ones_like(logits, dtype=logits.dtype, device=logits.device)
+        else:
+            mask = mask.to(dtype=logits.dtype, device=logits.device)
+            while mask.ndim < logits.ndim:
+                mask = mask.unsqueeze(0)
+        
+        B, C = logits.shape[:2]
+        dims = tuple(range(2, target.ndim))  # (2,3,4) for 5D tensors
+        pos = (target.float() * mask).sum(dim=dims) / mask.sum(dim=dims).clamp_min(1.0)
+        pos = pos.clamp(1e-6, 1 - 1e-6)      
+        pw  = ((1 - pos) / pos).to(dtype=logits.dtype, device=logits.device)
+        pw = pw.view(B, C, *([1] * (logits.ndim - 2)))   # -> (B, C, 1, 1, 1)
+        
+        per_voxel = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, target, reduction='none', pos_weight=pw)
+        
+        masked = per_voxel * mask
+        loss = masked.sum() / mask.sum().clamp_min(1.0)
+        return loss
+        
 
-def wack_weights():
-    print('fix wack_weights')
-    # if 0:
-    #     with torch.no_grad():
-    #             print("Before:", model.v[0].conv0_0.conv1.weight.view(-1)[0])
-    #             #model.v[0].apply(manual_reinit)
-    # elif 0:
-    #     with torch.no_grad():
-    #         for p in model.v[0].parameters():
-    #             p.add_(.1 * torch.randn_like(p))
-    #     print("After:", model.v[0].conv0_0.conv1.weight.view(-1)[0])
-    # else:
-    #     optimizer = torch.optim.AdamW(lr=0.7e-4, params=model.parameters(), weight_decay=0.7e-4)
+    def cropping_mask(self, t, crop):
+        # t: (B, C, D, H, W). crop is [b,c,cz,cy,cx] in your code; use spatial entries.
+        _, _, D, H, W = t.shape
+        cz, cy, cx = crop[-3], crop[-2], crop[-1]
+        m = torch.zeros((t.shape[0], 1, D, H, W), device=t.device, dtype=t.dtype)
+        m[..., cz:D-cz, cy:H-cy, cx:W-cx] = 1
+        return m
 
-    # tr['wack_weights'] = 1
+    
+    def check_valid(self, modules):
+        
+        self.cvv = CheckValid(modules)
+        self.cvv.check_shapes(self.tr)  
+        self.cvv.recommendation = self.cvv.recommend()
+                
+    def get_losses(self, preds, target_key='aff'):
+        #Choose valid region
+        self.tk.b('loss')
+        tr = self.tr
+        if tr['true_crop_for_loss']:
+            use_preds = []
+            use_target = []
+            use_masks = []
+            for vi in  range(len(tr['use_mips'])):
+                use_preds.append(crop_tensor(preds[vi], tr['crop_v'][vi]))
+                use_target.append(crop_tensor(self.pulled_b['aff'][vi], tr['crop_v'][vi]))
+                if self.loss_masks[vi] is not None:
+                    use_masks.append(crop_tensor(self.loss_masks[vi], tr['crop_v'][vi]))
+                else: 
+                    use_masks.append(None)
+        else:
+            use_preds = preds
+            use_target = self.pulled_b[target_key]
+            use_masks = self.loss_masks
 
+        loss_vals = []
+        for vi, pred in enumerate(use_preds):
+            if isinstance(pred, list):
+                supervivised_loss = []
+                for pi, pr in enumerate(pred):
+                    supervivised_loss.append(
+                        self.masked_bce_with_logits(logits=pr[:, 0:1 , :, :, :], 
+                                                     target=use_target[vi], 
+                                                     mask=use_masks[vi],))
+                loss_vals.append( sum(l * w for l,w in zip(supervivised_loss, tr['scale_losses']))) 
+            else:    
+                      loss_vals.append(
+                          self.masked_bce_with_logits(logits=pred[:, 0:1 , :, :, :], 
+                                                     target=use_target[vi], 
+                                                     mask=use_masks[vi],))
+        loss_val= sum(l * w for l,w in zip(loss_vals, tr['v_loss_scale'])) 
+        
+        self.tk.e('loss')
+        return loss_val, loss_vals
+    
+    
+def crop_tensor(raw_tensor, ct):
+    
+    if isinstance(raw_tensor, list):
+        cropped_tensor = []
+        for rt in raw_tensor:
+            if rt.ndim < len(ct):
+                ct = ct[-raw_tensor.ndim:]
+            end = torch.tensor(rt.shape) - torch.tensor(ct)
+            cropped_t = rt[tuple(slice(s, e) for s, e in zip(ct, end))]       
+            cropped_tensor.append(cropped_t)
+    else:
+        if raw_tensor.ndim < len(ct):
+            ct = ct[-raw_tensor.ndim:]
+        end = torch.tensor(raw_tensor.shape) - torch.tensor(ct)
+        cropped_tensor = raw_tensor[tuple(slice(s, e) for s, e in zip(ct, end))]     
 
-def manual_reinit(m):
-    print('fix manual_reinit')
-    # if isinstance(m, nn.Conv3d):
-    #     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-    #     if m.bias is not None:
-    #         nn.init.zeros_(m.bias)
-    # elif isinstance(m, nn.BatchNorm3d):
-    #     nn.init.ones_(m.weight)
-    #     nn.init.zeros_(m.bias)
-    # elif isinstance(m, nn.Linear):
-    #     nn.init.kaiming_normal_(m.weight, mode='fan_out')
-    #     if m.bias is not None:
-    #         nn.init.zeros_(m.bias)
-    # elif isinstance(m, nn.Module):
-    #     # This ensures nested blocks like conVGGBlock are reached
-    #     for child in m.children():
-    #         manual_reinit(child)
+    return cropped_tensor
 
+class CheckValid():
+    """
+    Use artificial boundary around dummy volumes to calculate validity masks
+    for the desired volume shapes that will be run through the inputed lmodule
+    list
+    """
+    
+    def __init__(self, modules, fill_with=1):
+        self.modules_in = modules
+                
+        ## make dummy network for calculating the validity of voxels    
+        self.test_model = torch.nn.ModuleList()
+        for v in self.modules_in: ## duplicate model
+            self.test_model.append(copy.deepcopy(v))
+        with torch.no_grad(): ## Set all weights
+            for m in self.test_model:
+                for param in m.parameters():
+                   param.fill_(fill_with)
+        
+        
+        
+    def check_shapes(self, tr, border_val=1):    
+        
+        self.param = {'crop_validity': np.array([.68, .95, .999])}
+        self.maps = []
+        self.masks = []
+        for mi, m in enumerate(self.test_model):
+           
+            self.maps.append({})
+            ## plot validit from edges
+            self.change_conv3d_padding_mode(m, 'replicate') ## change padding mode
+            t_shape = np.array(tr['v_shapes'][mi])
+            self.maps[mi]['test_shape'] = t_shape.copy()
+            pad_shape = t_shape + 2
+            border_tensor = torch.ones(1, 1, pad_shape[0], pad_shape[1], pad_shape[2]) * border_val
+            border_tensor[0, 0, 1:1+t_shape[0], 1:1+t_shape[1], 1:1+t_shape[2]] = 0           
+            border_tensor = border_tensor.repeat(1, tr['input_channels'][mi], 1, 1, 1)
+            border_tensor = border_tensor.to(tr['device'])
+            border_out, feats = self.test_model[mi](border_tensor)
+            border_map = border_out[-1][0, :].detach().cpu().squeeze().numpy()  # if deep supervision
+            border_map = border_map[1:-1,1:-1,1:-1]
+            self.maps[mi]['min_border_val'] = border_map.min()
+            self.maps[mi]['max_border_val'] = border_map.max()
+            border_map = border_map - border_map.min()
+            if border_map.max():
+                border_map = border_map / border_map.max()            
+            border_map = 1 - border_map            
+            border_samp_yx = border_map[t_shape[0]//2,:,:]
+            border_samp_zx = border_map[:, t_shape[1]//2,:]
 
+            rf_trace = []
+            bs = np.array(border_map.shape) // 2
+            rf_trace.append(border_map[0:bs[0], bs[1], bs[2]])
+            rf_trace.append(border_map[bs[0], 0:bs[1], bs[2]])
+            rf_trace.append(border_map[bs[0], bs[1], 0:bs[2]])
 
+            has_frac = self.param['crop_validity'] 
+            crops = []
+            rf_min = []
+            for rf in rf_trace:
+                if rf.shape[0]:
+                    rf = rf / rf.max()
+                    rf_min.append(rf.min())
+                    rf_cumsum = np.cumsum(rf) / rf.sum()
+                    crops.append([int(np.where(rf_cumsum >= f)[0][0])
+                                  for f in has_frac])
+                else:
+                    crops.append([0, 0, 0])
+            
+            self.masks.append(border_map.copy())
+            self.maps[mi]['border_section_yx'] = border_samp_yx.copy()
+            self.maps[mi]['border_section_zx'] = border_samp_zx.copy()
+            self.maps[mi]['rf_mins'] = rf_min.copy()
+            self.maps[mi]['rf'] = rf_trace.copy()
+            self.maps[mi]['crop'] = crops.copy()
 
+    def show_results(self):
+       
+            fig_test = dsp.figure(num_ax=9, fig_name='test_validity')
+            for mi, m in enumerate(self.maps):
+                fig_test.ax[mi].imshow(m['border_section_zx'], cmap='grey',vmax=1)
+                fig_test.ax[mi].set_title(f'v{mi} validity map')
+                fig_test.ax[mi+3].plot(m['rf'][0])
+                fig_test.ax[mi+3].set_title(f'v{mi} z rf')
+                fig_test.ax[mi+6].plot(m['rf'][1])
+                fig_test.ax[mi+6].set_title(f'v{mi} y rf')
+            fig_test.update()
+            
+        
+            
+    def recommend(self):
+            
+         for mi, m in enumerate(self.maps):
+             print(
+             f"Module_{mi}: tested shape {m['test_shape']}\n"
+             f"Validity map values ranged from {m['min_border_val']:0.2f} to {m['max_border_val']:0.2f}\n"
+             f"In yx, crop {m['crop'][1]} for validity fraction {self.param['crop_validity']}\n"
+             f"In  z, crop {m['crop'][0]} for validity fraction {self.param['crop_validity']}\n"
+             f" \n"
+             )
 
+    def change_conv3d_padding_mode(self, module, new_padding_mode='replicate'):
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.Conv3d):
+                # Rebuild the Conv3d layer with new padding mode
+                new_conv = torch.nn.Conv3d(
+                    in_channels=child.in_channels,
+                    out_channels=child.out_channels,
+                    kernel_size=child.kernel_size,
+                    stride=child.stride,
+                    padding=child.padding,
+                    dilation=child.dilation,
+                    groups=child.groups,
+                    bias=(child.bias is not None),
+                    padding_mode=new_padding_mode
+                )
+                # Copy weights and bias
+                new_conv.weight.data = child.weight.data.clone()
+                if child.bias is not None:
+                    new_conv.bias.data = child.bias.data.clone()
 
-
-
-
-
-
-
+                # Replace in parent module
+                setattr(module, name, new_conv)
+            else:
+                # Recurse into submodules
+                self.change_conv3d_padding_mode(child, new_padding_mode)
+                
+                
+    

@@ -79,11 +79,10 @@ class ticTocDic:
         self.t = np.zeros((num_t,4),'float64')
         self.td = {}
     
-    def m(self,keys):
+    def m(self, keys):
         for k in keys:
             self.td[k] = np.zeros(4,'float64')
             
-    
     def b(self,t_num=0):
         if isinstance(t_num,str):
             self.td[t_num][0:2] = [time.time(),0]

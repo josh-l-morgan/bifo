@@ -5,17 +5,12 @@ Created on Thu Aug  7 09:58:28 2025
 @author: jlmorgan
 """
 import numpy as np
-from dataclasses import dataclass
-import bifo.tools.voxTools as vt
+import bifo.tools.vox_tools as vt
 import torch
 from scipy.ndimage import rotate as nd_rotate
 import copy
-import skimage as sk
-from  skimage.transform import AffineTransform as affine 
-import torchvision
 import bifo.tools.display as dsp
 import matplotlib.pyplot as plt
-import torchvision.transforms.functional as F
 from bifo.tools.dtypes import ticTocDic
 
 
@@ -112,10 +107,14 @@ class BifPowder():
         request['is_input'] = True
         request['vox_sizes']= [np.array([1,1,1])]
         request['device'] = self.tr['device']
+        
+        request['buf_fac']  = 1
+        request['buf_add']  = 0
         if self.tr['augment_rotate']:
-             request['buf_fac'] = 2 ** (1/2)
-        else:
-            request['buf_fac'] = 1
+             request['buf_fac'] *= (2 ** (1/2))
+        if self.tr['jitter_frequency']:
+            request['buf_add'] += (self.tr['jitter_magnitude'] * 2) ## allow for 2 std
+           
         self.request_glob = request.copy()
         
                    
@@ -142,10 +141,13 @@ class BifPowder():
         self.pulled_c[request_key] = []
         for m in range(len(request['use_mips'])):
             targ_shape = request['target_shapes'][m]
+            add_buf = np.array([0, request['buf_add'], request['buf_add']]) 
+            add_buf = add_buf * (2 / request['vox_sizes'][m])
             buf_shape =  targ_shape * np.array([1, request['buf_fac'], request['buf_fac']])
-            fix_shape =  np.round(buf_shape) 
+            buf_shape = buf_shape + add_buf
+            fix_shape =  np.ceil(buf_shape) 
             request['pull_shapes'].append(fix_shape.copy().astype(int))
-            request['pull_fovs'].append( np.astype(fix_shape * request['vox_sizes'][m],int))
+            request['pull_fovs'].append( (fix_shape * request['vox_sizes'][m]).astype(int))
             
             if request_type=='zarr':
                 self.pulled_b[request_key].append(torch.empty(
@@ -182,29 +184,27 @@ class BifPowder():
         
     def pull(self):
         self.tk.b('pull')
-        if self.jit['do']:
-            self.jitter_pull()
-        else:
-            for ri, k in enumerate(self.requests.keys()):
-                request = self.requests[k]
-                if request['is_input']:
-                    for vi in range(self.num_v):
-                        pull_corner = np.round(self.center_voxes[vi] - request['pull_shapes'][vi] / 2)
-                        pull_win = np.array([pull_corner, pull_corner +  request['pull_shapes'][vi]]).astype(int)
-                        if request['request_type']=='points':
-                            pts = self.data['raw_pts'].copy() / request['vox_sizes'][vi]
-                            is_in = np.where(self.pts_in_win(pts, pull_win ))[0] ## select in fov space
-                            pts_in_fov = pts[is_in,:] - (pull_corner )
-                            self.pulled[k][vi] =  pts_in_fov 
+    
+        for ri, k in enumerate(self.requests.keys()):
+            request = self.requests[k]
+            if request['is_input']:
+                for vi in range(self.num_v):
+                    pull_corner = np.floor(self.center_voxes[vi] - request['pull_shapes'][vi][-3:] / 2)
+                    pull_win = np.array([pull_corner, pull_corner +  request['pull_shapes'][vi][-3:]]).astype(int)
+                    if request['request_type']=='points':
+                        pts = self.data['raw_pts'].copy() / request['vox_sizes'][vi]
+                        is_in = np.where(self.pts_in_win(pts, pull_win ))[0] ## select in fov space
+                        pts_in_fov = pts[is_in,:] - (pull_corner )
+                        self.pulled[k][vi] =  pts_in_fov 
+                    else:
+                        self.pulled[k][vi][:] = 0
+                        source_win = np.array([[0, 0, 0], self.zm.datasets[request['source_key']].shapes[vi]])
+                        transfer = vt.block_to_window(pull_win, source_win)
+                        if transfer['has_data']:
+                            vt.array_to_tensor(self.pulled[k][vi], transfer['win'], 
+                                       self.zm.datasets[request['source_key']].arr[vi], transfer['ch'])
                         else:
-                            self.pulled[k][vi][:] = 0
-                            source_win = np.array([[0, 0, 0], self.zm.datasets[request['source_key']].shapes[vi]])
-                            transfer = vt.block_to_window(pull_win, source_win)
-                            if transfer['has_data']:
-                                vt.array_to_tensor(self.pulled[k][vi], transfer['win'], 
-                                           self.zm.datasets[request['source_key']].arr[vi], transfer['ch'])
-                            else:
-                                    print('data window empty')
+                                print('data window empty')
                         
         self.tk.e('pull')
             
@@ -231,6 +231,22 @@ class BifPowder():
         rand_shift = (fov_shape) * np.random.rand(3) 
         center = fov_win[0,:] + rand_shift
         
+        self.center_voxes = []
+        for mi in range(len(vs)):
+            self.center_voxes.append(np.round(center / vs[mi]))
+            
+            
+            
+            
+    def location_list(self, key, pos, mode='random'):
+        """
+        pos should be n x 3 array of positions in z, y, x mip0 voxel space
+        """
+        if mode=='random':
+            pick = np.floor(np.random.rand() * pos.shape[0]).astype(int)
+            center = pos[pick,:]
+
+        vs = self.tr['v_vox_sizes']
         self.center_voxes = []
         for mi in range(len(vs)):
             self.center_voxes.append(np.round(center / vs[mi]))
@@ -424,31 +440,41 @@ class BifPowder():
                 self.pulled[key_out][vi][:] = affd
             
     def calc_affinities(self, m, shift):
+            
             affd = m.new_empty((1,3, m.shape[2], m.shape[3], m.shape[4]))
             affm = m.new_empty((1,1, m.shape[2], m.shape[3], m.shape[4]))
             m_stable = m.clone() 
-            for d in range(3):
-                dif = m_stable -  torch.roll(m, shifts=shift[d], dims=-(d+1))
-                affd[0,d,:] = dif == 0 ## add affinity to channel
+            for di in range(3):
+                d  = -(di + 1)
+                dif = m_stable -  torch.roll(m, shifts=shift[di], dims=-(di+1))
+                affd[0,di,:] = dif == 0 ## add affinity to channel
                 
                 ## reflect
-                affd[0,d,:] = affd[0,d,:] * torch.roll(affd[0,d,:], shifts=-shift[d], dims=-(d+1))
-                affd[0,d,:] = affd[0,d,:]  * (m > 0)
+                affd[0,di,:] = affd[0,di,:] * torch.roll(affd[0,di,:], shifts=-shift[di], dims=d)
+                affd[0,di,:] = affd[0,di,:]  * (m[0,0,:] > 0)
                 
                 ## negate invalid
-                low1 = np.array((1,d,0, 0, 0),int)
-                high1 = np.array((1,d,m.shape[2], m.shape[3], m.shape[4]),int)
+                low1 = np.array((1,di,0, 0, 0),int)
+                high1 = np.array((1,di,m.shape[2], m.shape[3], m.shape[4]),int)
                 low2 = low1.copy()
                 high2 = high1.copy()
-                low2[-d] = high1[-d]
-                high2[-d] = low1[-d]
+                low2[d] = high1[d]
+                high2[d] = low1[d]
                 slice1 = tuple(slice(c, s) for c, s in zip(low1, high2))
                 slice2 = tuple(slice(c, s) for c, s in zip(low2, high1))
-                affd[slice1] = 1
-                affd[slice2] = 1
+                affd[slice1] = 0
+                affd[slice2] = 0
             affm = affd.prod(1) 
             return affm, affd
+    
+    def relabel(self, key_in='labels', key_out='relabels', lookup=None  ):
         
+        if lookup is None:
+            for vi in range(self.num_v):
+                self.pulled[key_out][vi][:] = self.pulled[key_in][vi]
+                
+            for vi in range(self.num_v):
+                self.pulled[key_out][vi][:] = lookup[self.pulled[key_in][vi]]
     
     def aff_weights(self, key_in, key_out='aff_wieghts'):
         print('affinity weights not done')
@@ -496,7 +522,7 @@ class BifPowder():
                     for mi, m in enumerate(self.pulled[k]):
                         self.pulled[k][mi] = torch.transpose(m, -2, -1)
                     
-    def section_augment_info(self, key, frequency, magnitude):
+    def section_augment_info(self, key, frequency, magnitude, mag_type = 'sigma'):
     
             aug_seg = {}
             aug_seg['frequency'] = frequency
@@ -516,7 +542,10 @@ class BifPowder():
             max_z = z_num.max()
             z_offset = (max_z -z_num)//2
            
-            aug_seg['r_sigs'] = np.abs(np.random.randn(max_z, 2)) * magnitude
+            if mag_type == 'sigma':
+                aug_seg['r_sigs'] = np.abs(np.random.randn(max_z, 2)) * magnitude
+            else:
+                aug_seg['r_sigs'] = np.abs(np.random.rand(max_z, 2)) * magnitude * 2 - magnitude
             aug_seg['r_hit_full'] = np.where(np.random.rand(max_z) <= frequency)[0]
             aug_seg['r_hits'] = []
             for r in range(len(z_offset)):
@@ -643,26 +672,31 @@ class BifPowder():
         self.tk.b('augment')
 
         if frequency:
+            print('augmentation broken')
             ag = self.section_augment_info(key, frequency, 1)
             source_fov = np.ceil(ag['max_fov']).astype(int)
-            blob_field = np.zeros((1, source_fov[1], source_fov[2]))
 
             for zi in range(len(ag['r_hit_full'])):
-                blob_field = blob_field * 0
-                mids = np.random.rand(2) * blob_field.shape[1:]
-                edges = (np.random.rand(2) < .5).astype(float) * blob_field.shape[1:]
+                mids = np.random.rand(2) * source_fov[1:]
+                edges = (np.random.rand(2) < .5).astype(float) * source_fov[1:]
                 y_rand = np.sort(np.floor([mids[0], edges[0]]).astype(int))
                 x_rand = np.sort(np.floor([mids[1], edges[1]]).astype(int))
-                blob_field[0, y_rand[0]:y_rand[1]+1, x_rand[0]:x_rand[1]+1] = 1
                
               
                 for ai in range(self.num_v):
                     hit_z = ag['r_hits'][ai][zi] 
                     if hit_z >= 0:
-                        blob_scaled = self.downsample_3d_kernel(blob_field, ag['vox_sizes'][ai], method='mean')
-                        blob_pull = self.get_center(arr=blob_scaled, target_shape=ag['shapes'][ai,1:])
-                        blob_tensor = torch.from_numpy(blob_pull).to(self.pulled[key][ai])
-                        self.pulled[key][ai][0, 0, hit_z, :, :] = self.pulled[key][ai][0, 0, hit_z, :, :] - blob_tensor   
+                        max_shape = (source_fov / ag['vox_sizes'][ai]).astype(int)
+                        targ_shape = self.pulled[key][ai].shape[-3:]
+                        yrs = y_rand / ag['vox_sizes'][ai][1]
+                        xrs = x_rand / ag['vox_sizes'][ai][2]
+                        off_y = (max_shape[1] - targ_shape[1]) // 2
+                        off_x = (max_shape[2] - targ_shape[2]) // 2
+                        yrs = (yrs - off_y).astype(int)
+                        xrs = (xrs - off_x).astype(int)
+                        y0, y1 = np.clip(yrs, 0, targ_shape[1])
+                        x0, x1 = np.clip(xrs, 0, targ_shape[2])
+                        self.pulled[key][ai][0, 0, hit_z, y0:y1, x0:x1] = 0  
              
                 for ai in range(len(self.pulled[key])):
                     self.pulled[key][ai][torch.where(self.pulled[key][ai]<0)] = 0
@@ -741,7 +775,7 @@ class BifPowder():
                 
     def jitter(self, key, frequency, magnitude):
         if frequency:
-            ag = self.section_augment_info(key, frequency, magnitude)
+            ag = self.section_augment_info(key, frequency, magnitude, mag_type = 'max')
             
             jitters = []
             jitter_buf = []
@@ -759,55 +793,69 @@ class BifPowder():
             self.jit['do'] = 1
             self.jit['buf'] = jitter_buf.copy()
             self.jit['shift_planes'] = shift_planes 
-        else:
-            self.jit['do'] = 0
-       
-
-    def jitter_pull(self):
-        print('doesnt jitter yet')
-        print("should {self.jit['buf']")
-    
-        jit_buf = []
-        buf_shape = []
-        pull_corner = []
-        pull_win = []
-        buf_block = []
-        first_key = next(iter(self.requests))
-        print('WARNING. Using default key for jitter shape')
-        for vi in range(self.num_v):
-            jit_buf.append(self.jit['buf'][vi])
-            bigger = np.concatenate((np.zeros(1), jit_buf[-1][1,:] - jit_buf[-1][0,:])).astype(int)
-            buf_shape.append(self.requests[first_key]['pull_shapes'][vi] + bigger)
-            pull_corner.append(np.round(self.center_voxes[vi] - buf_shape[-1] / 2))
-            pull_win.append(np.array([pull_corner[-1], pull_corner[-1] +  buf_shape[-1]]).astype(int))
-            buf_block.append(torch.empty(tuple(buf_shape[vi])))
-    
-        for ri, k in enumerate(self.requests.keys()):
-            request = self.requests[k]
-            if request['is_input']:
+            
+            for ri, k in enumerate(self.requests.keys()):
+                request = self.requests[k]
                 for vi in range(self.num_v):
                     if request['request_type']=='points':
-                        pts = self.data['raw_pts'].copy() / request['vox_sizes'][vi]
-                        is_in = np.where(self.pts_in_win(pts, pull_win ))[0] ## select in fov space
-                        pts_in_fov = pts[is_in,:] - (pull_corner )
-                        self.pulled[k][vi] =  pts_in_fov 
-                        print('WARNING, points were not jittered')
+                        for sp in self.jit['shift_planes']:
+                            is_p = np.where(self.pulled[k][vi][:,0] == sp)
+                            self.pulled[k][vi][is_p,1]  +=  self.jit['shifts'][vi][sp][0]
+                            self.pulled[k][vi][is_p,2]  +=  self.jit['shifts'][vi][sp][1]
+                        print('WARNING, jitter points not tested')
                     else:
-                        buf_block[vi][:] = 0
-                        source_win = np.array([[0, 0, 0], self.zm.datasets[request['source_key']].shapes[vi]])
-                        transfer = vt.block_to_window(pull_win[vi], source_win)
-                        if transfer['has_data']:
-                            vt.array_to_tensor(buf_block[vi], transfer['win'], 
-                                       self.zm.datasets[request['source_key']].arr[vi], transfer['ch'])
-                            for sp in self.jit['shift_planes']:
-                                buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][0], dims=0)
-                                buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][1], dims=1)
-                            self.pulled[k][vi][:] = buf_block[vi][:,
-                                -jit_buf[vi][0,0]:-jit_buf[vi][0,0] + request['pull_shapes'][vi][1], 
-                                -jit_buf[vi][0,1]:-jit_buf[vi][0,1] + request['pull_shapes'][vi][2]] 
+                        for sp in self.jit['shift_planes']:
+                            self.pulled[k][vi][0,0,sp,:] = torch.roll(self.pulled[k][vi][0,0,sp,:] , self.jit['shifts'][vi][sp][0], dims=-1)
+                            self.pulled[k][vi][0,0,sp,:] = torch.roll(self.pulled[k][vi][0,0,sp,:] , self.jit['shifts'][vi][sp][1], dims=-2)
+                  
+        else:
+            self.jit['do'] = 0         
+        
+        
+       
+
+    # def jitter_pull(self):
+    
+    #     jit_buf = []
+    #     buf_shape = []
+    #     pull_corner = []
+    #     pull_win = []
+    #     buf_block = []
+    #     first_key = next(iter(self.requests)) ## 'WARNING. Using default key for jitter shape'
+    #     for vi in range(self.num_v):
+    #         jit_buf.append(self.jit['buf'][vi])
+    #         bigger = np.concatenate((np.zeros(1), jit_buf[-1][1,:] - jit_buf[-1][0,:])).astype(int)
+    #         buf_shape.append(self.requests[first_key]['pull_shapes'][vi] + bigger)
+    #         pull_corner.append(np.round(self.center_voxes[vi] - buf_shape[-1] / 2))
+    #         pull_win.append(np.array([pull_corner[-1], pull_corner[-1] +  buf_shape[-1]]).astype(int))
+    #         buf_block.append(torch.empty(tuple(buf_shape[vi])))
+    
+    #     for ri, k in enumerate(self.requests.keys()):
+    #         request = self.requests[k]
+    #         if request['is_input']:
+    #             for vi in range(self.num_v):
+    #                 if request['request_type']=='points':
+    #                     pts = self.data['raw_pts'].copy() / request['vox_sizes'][vi]
+    #                     is_in = np.where(self.pts_in_win(pts, pull_win ))[0] ## select in fov space
+    #                     pts_in_fov = pts[is_in,:] - (pull_corner )
+    #                     self.pulled[k][vi] =  pts_in_fov 
+    #                     print('WARNING, points were not jittered')
+    #                 else:
+    #                     buf_block[vi][:] = 0
+    #                     source_win = np.array([[0, 0, 0], self.zm.datasets[request['source_key']].shapes[vi]])
+    #                     transfer = vt.block_to_window(pull_win[vi], source_win)
+    #                     if transfer['has_data']:
+    #                         vt.array_to_tensor(buf_block[vi], transfer['win'], 
+    #                                    self.zm.datasets[request['source_key']].arr[vi], transfer['ch'])
+    #                         for sp in self.jit['shift_planes']:
+    #                             buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][0], dims=0)
+    #                             buf_block[vi][sp,:] = torch.roll(buf_block[vi][sp,:], self.jit['shifts'][vi][sp][1], dims=1)
+    #                         self.pulled[k][vi][:] = buf_block[vi][:,
+    #                             -jit_buf[vi][0,0]:-jit_buf[vi][0,0] + request['pull_shapes'][vi][1], 
+    #                             -jit_buf[vi][0,1]:-jit_buf[vi][0,1] + request['pull_shapes'][vi][2]] 
                                 
-                        else:
-                                print('data window empty')
+    #                     else:
+    #                             print('data window empty')
                     
     
     

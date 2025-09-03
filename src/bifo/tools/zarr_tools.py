@@ -9,14 +9,14 @@ Tools for making and manipulating zarr files
 """
 import zarr
 import numpy as np
-import bifo.tools.voxTools as vt
+import bifo.tools.vox_tools as vt
 import bifo.tools.dtypes as dtypes
 import matplotlib.pyplot as plt
 
 
 
 def makeMultiscaleGroup(z_path=None, group_name=None, zarr_shape=None,
-                        z_chunk_shape = [32, 256, 256], num_scales=9, dsamp= [1,2,2]):
+                        z_chunk_shape = [32, 256, 256], num_scales=9, dsamp= [1,2,2], dtype='float32'):
         """
         Make multiscale zarr with specific group name and number of mip levels (downsampl = 2 ** level)
         if zarr path exists, new group or new mip levels will be added
@@ -56,7 +56,7 @@ def makeMultiscaleGroup(z_path=None, group_name=None, zarr_shape=None,
                 name= str(level),
                 shape=down_shape,
                 chunks=down_chunks,
-                dtype='float32')
+                dtype=dtype)
             #zarr.Blosc(cname='zstd')
 
 
@@ -291,7 +291,7 @@ def fill_multiscale_from_high_to_low(zrm_group, method='mean',
         z_window = np.array([[0,0,0],zup.shape])
     
     move_mips = [r for r in range(from_mip, to_mip)]
-    mip_dif = [dsamp ** (r-from_mip) for r in move_mips]
+    #mip_dif = [dsamp ** (r-from_mip) for r in move_mips]
     
     for m in range(len(move_mips)):
         
@@ -301,7 +301,7 @@ def fill_multiscale_from_high_to_low(zrm_group, method='mean',
         zdn = zrm_group[f'{tm}']
         zup_chunk = zup.chunks
         grab_shape = zup_chunk * dsamp
-        zwn = -(-z_window//mip_dif[m])
+        zwn = np.floor(z_window// (dsamp ** fm)) #  -(-z_window//mip_dif[m])
         chkl = vt.list_chunks(zwn, grab_shape)
         num_chunk = len(chkl)
        
@@ -325,11 +325,120 @@ def fill_multiscale_from_high_to_low(zrm_group, method='mean',
                 print('bark')
                 breakpoint()
           
-         
+def fill_multiscale_from_label(zrm_group, upsamp_method='nearest', 
+                                     downsamp_method='mode',
+                                     from_mip=4, 
+                                     to_mip = None,
+                                     dsamp=[1,2,2],
+                                     z_window=None,
+                                     quiet=0):
+    """
+    Fill the mip levels of a multiscale zarr file by downsampling
+    the zarr group zrm_group/from_mip must already be filled
+
+    Parameters
+    ----------
+    zrm_group : TYPE
+        DESCRIPTION.
+    method : TYPE, optional
+        DESCRIPTION. The default is 'mean'.
+    from_mip : TYPE, optional
+        DESCRIPTION. The default is 0.
+    to_mip : TYPE, optional
+        DESCRIPTION. The default is None.
+    dsamp : TYPE, optional
+        DESCRIPTION. The default is [1,2,2].
+
+    Returns
+    -------
+    None.
+
+    """
+    
+    dsamp = np.array(dsamp)
+    if z_window is None:
+        zup = zrm_group[f'{from_mip}']
+        z_window = np.array([[0,0,0],zup.shape])
+        z_window = z_window * dsamp ** from_mip
+    
+    z_type = zrm_group[f'{from_mip}'].dtype
+    
+    if to_mip is None:
+        ds =  zrm_group.attrs['multiscales'][0]['datasets']
+        to_mip = [0,len(ds)-1]
+    
+    ## Going down
+    move_mips = np.arange(from_mip, to_mip[1]+1).astype(float)
+    
+    for mi in range(len(move_mips)-1):
+        
+        fm = move_mips[mi]
+        tm = move_mips[mi+1] 
+        zfrom = zrm_group[f'{fm:.0f}']
+        zto = zrm_group[f'{tm:.0f}']
+        grab_shape = zfrom.chunks  * dsamp
+        
+        zwn = np.ceil(z_window / (dsamp ** fm)).astype(int)
+        zwn[0,:] = np.max(np.array([[0,0,0], zwn[0,:]]),0)
+        zwn[1,:] = np.min(np.array([zfrom.shape[-3:], zwn[1,:]]),0)
+        chkl = vt.list_chunks(zwn, grab_shape)
+        num_chunk = len(chkl)
+       
+        for ci in range(num_chunk):
+            
+            if not quiet:
+                print(f'downsampling mip {fm} to mip {tm}, chunk {ci} of {num_chunk}')            
+            
+            
+            ch = chkl[ci]
+            cw_from = ch['tr']['full']
+
+            zfrom_vol = vt.get_win(zfrom, cw_from)
+            zto_vol = vt.downsample_array(zfrom_vol, dsamp, 'mode').astype(z_type) #'mode' is ideal but slower
+            cw_to = vt.downsample_win(cw_from, dsamp)
+     
+            # vt.put_win(zto, cw_to, zto_vol)
+            vt.put_win_brute(zto, cw_to, zto_vol)
+            print(f'from {zfrom_vol.max()} to {zto_vol.max()}')
+              
+    ## going up
+    move_mips = np.arange(from_mip, to_mip[0]-1, -1).astype(float)
+    
+    for mi in range(len(move_mips)-1):
+        
+        fm = move_mips[mi]
+        tm = move_mips[mi+1] 
+        zfrom = zrm_group[f'{fm:.0f}']
+        zto = zrm_group[f'{tm:.0f}']
+        grab_shape = zfrom.chunks * 1
+        zwn = np.ceil(z_window / (dsamp ** fm)).astype(int)
+        zwn[0,:] = np.max(np.array([[0,0,0], zwn[0,:]]),0)
+        zwn[1,:] = np.min(np.array([zfrom.shape[-3:], zwn[1,:]]),0)
+        chkl = vt.list_chunks(zwn, grab_shape)
+        num_chunk = len(chkl)
+       
+        for ci in range(num_chunk):
+            
+            if not quiet:
+                print(f'upsampling mip {fm} to mip {tm}, chunk {ci} of {num_chunk}')            
+            
+            ch = chkl[ci]
+            cw_from = ch['tr']['full']
+
+            zfrom_vol = vt.get_win(zfrom, cw_from)
+            zto_vol = vt.upsample_array(zfrom_vol, dsamp).astype(z_type)
+                        
+            cw_to = vt.downsample_win(cw_from, 1/dsamp)
+     
+            try:
+                vt.put_win(zto, cw_to, zto_vol)
+            except:
+                print('bark')
+                breakpoint()
+    
              
     
-def scan_zarr_to_fig(zarr_group, pw=None, cw=[1, 512, 512], scan_mips=[3,2,1], dsamp=[1, 2, 2],
-                     use_channel=None):
+def scan_zarr_to_fig(zarr_group, pw=None, cw=[1, 512, 512], scan_mips=[3,2,1], dsamp=[1, 2, 2],  use_channel=None, mode=None):
     """
     Scan a window (pw) of a multiresolution zar-group.  Choose which mip levels
     to compare (scan_mips)
@@ -353,57 +462,249 @@ def scan_zarr_to_fig(zarr_group, pw=None, cw=[1, 512, 512], scan_mips=[3,2,1], d
 
     """
     import bifo.tools.display as dsp
-    
+    print(mode)
     num_mip = len(scan_mips)
+    num_groups = len(zarr_group)
     dsamp = np.array(dsamp)
     
+    if mode is None:
+        mode = ['max'] * num_groups
     
     zrms = []
-    for m in scan_mips:
-        zrms.append(zarr_group[f'{m}'])
+    for gi, g in enumerate(zarr_group):
+        zrm = []
+        for m in scan_mips:
+            zrm.append(zarr_group[gi][f'{m}'])
+        zrms.append(zrm)
     
     if pw is None:
-        pw = np.array([[0, 0, 0], zrms[0].shape])
+        pw = np.array([[0, 0, 0], zrms[0][0].shape])
     else:
         pw = np.array(pw) 
+    pw_f = pw.copy()
+    cw_f = cw * dsamp ** scan_mips[0]
 
-    mip_difs = [scan_mips[a] - scan_mips[0] for a in range(3)]
+    chkl = vt.list_chunks(pw_f,cw_f)
     
-    chkl = vt.list_chunks(pw,cw)
-    
-    fig = dsp.figure(num_ax=num_mip) 
+    fig = dsp.figure(num_mip * num_groups, 'scan_zarr_window', rows=num_groups) 
     z_mean = np.zeros((cw[1], cw[2]))
-    for a in range(num_mip):
+    for a in range(len(fig.ax)):
         fig.ax[a].img = fig.ax[a].imshow(z_mean, cmap='gray', vmax=1)
     
     for ci, ch in enumerate(chkl):
         
-                print(f"chunk {ci} of {len(chkl)}, corner={ch['lower']}")
-                
-                zw = np.array([ch['lower'],ch['cap']])
-                for a in range(num_mip):
-                    zw_d = np.astype(zw / (dsamp ** mip_difs[a]),int)
-                    if use_channel is None:
-                        z_samp =  zrms[a][zw_d[0,0]:zw_d[1,0], 
-                                   zw_d[0,1]:zw_d[1,1],
-                                   zw_d[0,2]:zw_d[1,2]]
-                    else:
-                        z_samp =  zrms[a][zw_d[0,0]:zw_d[1,0], 
-                                   zw_d[0,1]:zw_d[1,1],
-                                   zw_d[0,2]:zw_d[1,2],
-                                   use_channel]
-                    
+        print(f"chunk {ci} of {len(chkl)}, corner={ch['lower']}")
+        zw = ch['tr']['full']
+        
+        for gi in range(num_groups):
+            for ai in range(num_mip):
+                zw_d = (zw / (dsamp ** scan_mips[ai])).astype(int)
+                if (use_channel is None) | zrms[gi][ai].ndim < 4:
+                    z_samp =  zrms[gi][ai][zw_d[0,0]:zw_d[1,0], 
+                               zw_d[0,1]:zw_d[1,1],
+                               zw_d[0,2]:zw_d[1,2]]
+                else:
+                    z_samp =  zrms[gi][ai][use_channel[gi], zw_d[0,0]:zw_d[1,0], 
+                               zw_d[0,1]:zw_d[1,1],
+                               zw_d[0,2]:zw_d[1,2]]
+                                        
+                if mode[gi]=='mean':
                     z_mean = z_samp.mean(0)
-                    z_mean = z_mean - z_mean.min()
-                    fig.ax[a].img.set_data(z_mean/z_mean.max())
-                
-                fig.update() 
-                plt.pause(.3)
+                elif mode[gi] == 'max': 
+                    z_mean = z_samp.max(0)
+                    
+                max_mean = z_mean.max()
+                if max_mean:
+                    z_mean = z_mean/max_mean +.3
+                    
+                ax_id = ai + gi * num_mip
+                fig.ax[ax_id].img.set_data(z_mean)
+                    
+        fig.update() 
                
 
 
 
+def write_ngff_v04_attrs_broken(z_path, group_name, base_voxel_size_um=(0.04, 0.004, 0.004),
+                         dsamp=(1,2,2), has_channel=False, num_scales=9):
+    """
+    base_voxel_size_um = (z_um, y_um, x_um) at level 0
+    dsamp = per-axis downsample factors between levels, e.g. (1,2,2)
+    has_channel = True if your arrays are CZYX (else ZYX)
+    """
+    zarr_root = zarr.open_group(z_path, mode='a')
+    zarr_ms_group = zarr_root.require_group(group_name)
+    
+    
+    
+    # enumerate existing levels
+    levels = sorted([k for k,v in zarr_ms_group.items() if isinstance(v, zarr.Array)],
+                    key=lambda s: int(s))
+    zyx0 = np.array(base_voxel_size_um, float)
+    dsamp = np.array(dsamp, float)
+
+    # # axes
+    # axes = []
+    # if has_channel:
+    #     axes.append({"name": "c", "type": "channel"})
+    # axes += [
+    #     {"name": "z", "type": "space", "unit": "micrometer"},
+    #     {"name": "y", "type": "space", "unit": "micrometer"},
+    #     {"name": "x", "type": "space", "unit": "micrometer"},
+    # ]
+
+    axes =  [
+        {'name': 'z', 'type': 'space', 'unit': 'micrometer'},
+        {'name': 'y', 'type': 'space', 'unit': 'micrometer'},
+        {'name': 'x', 'type': 'space', 'unit': 'micrometer'},
+        ]
+
+
+
+    # datasets = []
+    # for i,lev in enumerate(levels):
+    #     # physical scale at this level = base_voxel_size * (dsamp ** level_index)
+    #     # prepend channel scale 1 if there's a channel axis
+    #     scale_zyx = (zyx0 * (dsamp ** i)).tolist()
+    #     scale = ([1.0] if has_channel else []) + scale_zyx
+    #     datasets.append({
+    #         "path": lev,
+    #         "coordinateTransformations": [{"type": "scale", "scale": scale}]
+    #     })
+        
+    datasets =  [{'path': f'{i}'} for i in range (num_scales)],
+
+
+    zarr_ms_group.attrs["multiscales"] = [{
+        "version": "0.1",
+        "name": group_name, #group.name.rsplit("/",1)[-1] or "image",
+        "axes": axes,
+        "datasets": datasets
+    }]
+
+    # group.attrs["omero"] = {
+    #     "channels": [
+    #         {"label": "ch0", "color": "FFFFFF", "window": {"start": 0.0, "end": 1.0}},
+    #         # add one dict per channel
+    #     ]
+    # }
+    
+def reset_multiscale_attrs(z_path, group_name, num_scales=9):
+    zarr_root = zarr.open_group(z_path, mode='a')
+    zarr_ms_group = zarr_root.require_group(group_name)
+  
+    zarr_ms_group.attrs['multiscales'] = [{
+        'version': '0.1',
+        'name': group_name,
+        'datasets': [{'path': f'{i}'} for i in range (num_scales)],
+        'axes': [
+            {'name': 'z', 'type': 'space', 'unit': 'micrometer'},
+            {'name': 'y', 'type': 'space', 'unit': 'micrometer'},
+            {'name': 'x', 'type': 'space', 'unit': 'micrometer'},
+            ]
+    }]
+    
+    
+   
+def write_ngff_v04_attrs(z_path, group_name, base_voxel_size_um=(1, 1, 1),
+                         dsamp=(1,2,2), has_channel=False, num_scales=9):
+    
+    root = zarr.open_group(z_path, mode='a')
+    g = root.require_group(group_name)
+  
+    
+    
+    # enumerate existing levels
+    levels = sorted([k for k,v in g.items() if isinstance(v, zarr.Array)],
+                    key=lambda s: int(s))
+    zyx0 = np.array(base_voxel_size_um, float)
+    dsamp = np.array(dsamp, float)
+  
+    
+    axes =  [
+        {'name': 'z', 'type': 'space', 'unit': 'micrometer'},
+        {'name': 'y', 'type': 'space', 'unit': 'micrometer'},
+        {'name': 'x', 'type': 'space', 'unit': 'micrometer'},
+        ]
+    
+    
+    
+    datasets = []
+    for mi, lev in enumerate(levels):
+        # physical scale at this level = base_voxel_size * (dsamp ** level_index)
+        # prepend channel scale 1 if there's a channel axis
+        
+        scale_zyx = (zyx0 * (dsamp ** int(lev))).tolist()
+        scale = ([1.0] if has_channel else []) + scale_zyx
+        datasets.append({
+            "path": lev,
+            "coordinateTransformations": [{"type": "scale", "scale": scale}]
+        })
+    
+    
+    #datasets =  [{'path': f'{i}'} for i in range (num_scales)]
+
+ 
+    
+    g.attrs['multiscales'] = [{
+        'version': '0.1',
+        'name': group_name,
+        'datasets': datasets,
+        'axes': axes
+    }]
+     
+    
+    ms = g.attrs["multiscales"][0]
+    print("version:", ms["version"])
+    print("axes:", [a["name"] for a in ms["axes"]])
+    print("paths:", [d["path"] for d in ms["datasets"]])
+    print("missing:", [p for p in [d["path"] for d in ms["datasets"]] if p not in g.array_keys()])
+        
+    
+    
+
+def diagnose_ngff_v04(group_path):
+    
+    g = zarr.open_group(group_path, mode="r")
+    ms_all = g.attrs.get("multiscales", [])
+    print("arrays under group:", list(g.array_keys()))
+    if not ms_all:
+        print("❌ no multiscales in this group"); return
+    ms = ms_all[0]
+    print("version:", ms.get("version"))
+    axes = ms.get("axes", [])
+    print("axes:", [a.get("name") for a in axes])
+    ds = ms.get("datasets", [])
+    print("dataset paths:", [d.get("path") for d in ds])
+
+    # 1) paths must be relative; must exist as arrays
+    bad_paths = [d["path"] for d in ds if not isinstance(d.get("path"), str) or d["path"].startswith("/")]
+    missing   = [d["path"] for d in ds if d.get("path") not in g.array_keys()]
+    print("leading-slash paths:", bad_paths)
+    print("missing arrays:", missing)
+
+    # 2) scale length must equal len(axes)
+    for i, d in enumerate(ds):
+        ct = d.get("coordinateTransformations", [])
+        if not ct:
+            print(f"⚠️ dataset {d.get('path')} has no coordinateTransformations")
+            continue
+        for t in ct:
+            if t.get("type") == "scale":
+                scale = t.get("scale")
+                print(f"scale[{d.get('path')}]:", scale)
+                if not isinstance(scale, (list, tuple)) or len(scale) != len(axes):
+                    print(f"❌ scale length {len(scale)} != #axes {len(axes)} at dataset {d.get('path')}")
+
+    # # 3) sanity: sample a few voxels from declared datasets
+    # for d in ds[:2]:  # first 2 datasets
+    #     arr = g[d["path"]]
+    #     z,y,x = np.array(arr.shape)//2
+    #     print(f"sample {d['path']} shape={arr.shape} dtype={arr.dtype} mid={arr[z,y,x]}")
+    #     # quick nonzero probe
+    #     nz = np.any(arr[z, ::max(1,arr.shape[1]//128), ::max(1,arr.shape[2]//128)])
+    #     print(f"  nonzero slice probe @z={z}: {nz}")
 
 
     
-    
+        

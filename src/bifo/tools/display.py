@@ -24,24 +24,31 @@ def col_map(c_type='rand',num_col = 256):
     
 
 class figure:
-    def __init__(self, num_ax=1, fig_name=None):
+    def __init__(self, num_ax=1, fig_name=None, rows=None):
         
         self.fig = plt.figure(figsize=(8,8), num=fig_name)
         self.fig.clear() 
           
         self.ax = []
-        ax_rows = np.floor(num_ax ** (1/2))
+        if rows is None:
+            ax_rows = np.floor(num_ax ** (1/2))
+        else:
+            ax_rows = rows
         ax_cols = np.ceil(num_ax/ax_rows)
         for a in range(num_ax):
             self.ax.append(self.fig.add_subplot(int(ax_rows), int(ax_cols), a+1))
 
     def update(self):
         for a in self.ax:
+            if hasattr(a, 'img'):
+                h, w = a.img.get_array().shape
+                a.img.set_extent((0, w, h, 0))
+        for a in self.ax:
             a.relim()
             a.autoscale_view()
         self.fig.canvas.flush_events()
         self.fig.canvas.draw()
-        plt.pause(0.001) 
+        plt.pause(0.01) 
 
     def make_img(self, ax_id=0, i_shape=[512, 512], vmin=0, vmax=255, cmap='grey'):
         blank = np.zeros(np.squeeze(i_shape))
